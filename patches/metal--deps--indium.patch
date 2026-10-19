@@ -1936,7 +1936,7 @@ index 23fd2d3..1a48b81 100644
 +	return _gpuAddress;
  };
 diff --git a/src/indium/command-buffer.cpp b/src/indium/command-buffer.cpp
-index 43f4a84..c1448da 100644
+index 43f4a84..0735daf 100644
 --- a/src/indium/command-buffer.cpp
 +++ b/src/indium/command-buffer.cpp
 @@ -1,3 +1,8 @@
@@ -2274,7 +2274,7 @@ index 43f4a84..c1448da 100644
  	auto encoder = std::make_shared<Indium::PrivateComputeCommandEncoder>(shared_from_this(), descriptor);
  	{
  		std::scoped_lock lock(_mutex);
-@@ -91,44 +355,276 @@ std::shared_ptr<Indium::ComputeCommandEncoder> Indium::PrivateCommandBuffer::com
+@@ -91,44 +355,299 @@ std::shared_ptr<Indium::ComputeCommandEncoder> Indium::PrivateCommandBuffer::com
  	return computeCommandEncoder(ComputePassDescriptor { {}, dispatchType });
  };
  
@@ -2298,6 +2298,13 @@ index 43f4a84..c1448da 100644
 +	VkCommandBuffer barrierCommandBuffer = VK_NULL_HANDLE;
 +	std::chrono::steady_clock::time_point since;
 +	bool timerStarted = false;
++	// The batch window is closed by a timer thread. Rather than polling the queue
++	// mutex every 500 us (which took the lock the submit worker holds through a
++	// whole submission ~2000 times a second), the thread sleeps until the window's
++	// deadline and is woken by wakePending when a new batch opens.
++	std::mutex timerMutex;
++	std::condition_variable wake;
++	std::atomic<bool> wakePending {false};
 +};
  
 -	for (const auto& encoder: _commandEncoders) {
@@ -2306,19 +2313,9 @@ index 43f4a84..c1448da 100644
 -				if (auto privateTexture = std::dynamic_pointer_cast<PrivateTexture>(texture)) {
 -					privateTexture->precommit(shared_from_this());
 -				}
--			}
--			for (const auto& texture: renderEncoder->readWriteTextures()) {
--				if (auto privateTexture = std::dynamic_pointer_cast<PrivateTexture>(texture)) {
--					privateTexture->precommit(shared_from_this());
--				}
 +SubmitBatchState& submitBatchState() {
 +	static SubmitBatchState* state = new SubmitBatchState;
 +	return *state;
-+}
-+
-+std::condition_variable& submitBatchWake() {
-+	static std::condition_variable* cv = new std::condition_variable;
-+	return *cv;
 +}
 +
 +VkCommandBuffer submitBatchBarrier(const std::shared_ptr<Indium::PrivateDevice>& device) {
@@ -2416,16 +2413,31 @@ index 43f4a84..c1448da 100644
 +	state.timerStarted = true;
 +	std::thread([device]() {
 +		auto& state = submitBatchState();
-+		std::mutex wakeMutex;
++		constexpr auto window = std::chrono::microseconds(500);
 +		for (;;) {
 +			{
-+				std::unique_lock<std::mutex> lock(wakeMutex);
-+				/* darling-lol perf: 500µs batch window balances submission
-+				 * merging with latency; the old 2ms added visible input lag. */
-+				submitBatchWake().wait_for(lock, std::chrono::microseconds(500));
++				// Block until a batch opens. The timeout is only a safety net.
++				std::unique_lock<std::mutex> lock(state.timerMutex);
++				state.wake.wait_for(lock, std::chrono::seconds(1), [&] {
++					return state.wakePending.exchange(false, std::memory_order_relaxed);
++				});
  			}
+-			for (const auto& texture: renderEncoder->readWriteTextures()) {
+-				if (auto privateTexture = std::dynamic_pointer_cast<PrivateTexture>(texture)) {
+-					privateTexture->precommit(shared_from_this());
+-				}
++			std::chrono::steady_clock::time_point deadline;
++			{
++				std::unique_lock<std::mutex> queueLock(device->graphicsQueueMutex());
++				if (state.items.empty()) continue;
++				/* darling-lol perf: 500us batch window balances submission
++				 * merging with latency; the old 2ms added visible input lag. */
++				deadline = state.since + window;
+ 			}
++			// Wait out the window without holding the queue mutex, then flush.
++			std::this_thread::sleep_until(deadline);
 +			std::unique_lock<std::mutex> queueLock(device->graphicsQueueMutex());
-+			if (!state.items.empty() && std::chrono::steady_clock::now() - state.since >= std::chrono::microseconds(500)) flushSubmitBatchLocked();
++			if (!state.items.empty() && std::chrono::steady_clock::now() >= deadline) flushSubmitBatchLocked();
  		}
 +	}).detach();
 +}
@@ -2475,6 +2487,16 @@ index 43f4a84..c1448da 100644
 +	static const bool value = access("/tmp/metal-present-dispatch-wait", F_OK) == 0;
 +	return value;
 +}
++// The frame-end sync is the default; /tmp/metal-async-no-frame-sync disables it inside one process
++// for A/B runs. Re-read every 256 commits instead of an access() (a Darling RPC) on every presenting
++// commit, which is in the frame's critical path.
++bool frameSyncEnabled() {
++	static std::atomic<bool> value {true};
++	static std::atomic<unsigned> calls {0};
++	if ((calls.fetch_add(1, std::memory_order_relaxed) & 255) == 0)
++		value.store(access("/tmp/metal-async-no-frame-sync", F_OK) != 0, std::memory_order_relaxed);
++	return value.load(std::memory_order_relaxed);
++}
 +}
 +bool Indium::bindingReuseEnabled() {return bindingReuse.load(std::memory_order_relaxed);}
  
@@ -2492,7 +2514,7 @@ index 43f4a84..c1448da 100644
 +		// right after this call, so let the worker catch up first (it ran in parallel during the frame, the wait is its
 +		// remaining lag); otherwise the present misses this pump and is shown one frame late, sometimes two per pump.
 +		// Guest flag file /tmp/metal-async-no-frame-sync disables it for A/B runs.
-+		if (presents && presentDispatchWaitEnabled() && access("/tmp/metal-async-no-frame-sync", F_OK) != 0) {
++		if (presents && presentDispatchWaitEnabled() && frameSyncEnabled()) {
 +			// Opt-in narrow wait (/tmp/metal-present-dispatch-wait): this commit's task signals the token when it is
 +			// done, i.e. when the present dispatch (and, because the worker is FIFO, every replay queued before it) has
 +			// happened. Waiting for the token instead of the queue's idle state does not block on later tasks.
@@ -2513,7 +2535,7 @@ index 43f4a84..c1448da 100644
 +			AsyncEncode::PoolScope pool;
 +			self->commit();
 +		});
-+		if (presents && access("/tmp/metal-async-no-frame-sync", F_OK) != 0) {
++		if (presents && frameSyncEnabled()) {
 +			SubmitThread::drain("drain@commit");
 +		}
 +		return;
@@ -2569,7 +2591,7 @@ index 43f4a84..c1448da 100644
  
  	for (const auto& encoder: _commandEncoders) {
  		if (auto renderEncoder = std::dynamic_pointer_cast<PrivateRenderCommandEncoder>(encoder)) {
-@@ -138,18 +634,67 @@ void Indium::PrivateCommandBuffer::commit() {
+@@ -138,18 +657,69 @@ void Indium::PrivateCommandBuffer::commit() {
  			readWriteTextures.insert(readWriteTextures.end(), readWrite.begin(), readWrite.end());
  		}
  
@@ -2585,14 +2607,16 @@ index 43f4a84..c1448da 100644
  
 +    // Views share synchronization with their root texture. Deduplicate that owner,
 +    // including read/write overlap, before locking or reserving timeline values.
-+    auto rootTexture = [](std::shared_ptr<Texture> texture) {
-+        while (auto parent = texture->parentTexture()) texture = parent;
-+        return texture;
++    auto rootTexture = [](const std::shared_ptr<Texture>& texture) {
++        std::shared_ptr<Texture> root = texture;
++        while (auto parent = root->parentTexture()) root = parent;
++        return root;
 +    };
 +    // The old form compared every root against a growing vector (O(n^2) per commit,
 +    // twice) and then did another O(n*m) pass to drop read/write overlap. Hash the
 +    // roots once: a pass records a few dozen textures, so this is a small but
-+    // per-commit saving on the ordered worker.
++    // per-commit saving on the ordered worker. The sets are reused across commits
++    // (the worker is one thread and they are cleared on every use).
 +    auto canonicalize = [&](std::vector<std::shared_ptr<Texture>>& textures, std::unordered_set<Texture*>& roots) {
 +        roots.clear();
 +        size_t out = 0;
@@ -2602,8 +2626,8 @@ index 43f4a84..c1448da 100644
 +        }
 +        textures.resize(out);
 +    };
-+    std::unordered_set<Texture*> writeRoots;
-+    std::unordered_set<Texture*> readRoots;
++    static thread_local std::unordered_set<Texture*> writeRoots;
++    static thread_local std::unordered_set<Texture*> readRoots;
 +    canonicalize(readWriteTextures, writeRoots);
 +    canonicalize(readOnlyTextures, readRoots);
 +    readOnlyTextures.erase(std::remove_if(readOnlyTextures.begin(), readOnlyTextures.end(),
@@ -2643,7 +2667,7 @@ index 43f4a84..c1448da 100644
  	VkCommandBufferSubmitInfo commandBufferInfo {};
  
  	VkSemaphoreSubmitInfo signalEventLoopInfo {};
-@@ -159,6 +704,7 @@ void Indium::PrivateCommandBuffer::commit() {
+@@ -159,6 +729,7 @@ void Indium::PrivateCommandBuffer::commit() {
  	signalEventLoopInfo.value = timelineSemaphore->count;
  	signalInfos.push_back(signalEventLoopInfo);
  
@@ -2651,7 +2675,7 @@ index 43f4a84..c1448da 100644
  	std::vector<std::shared_ptr<BinarySemaphore>> extraWaitSemaphores;
  
  	const auto handleTextureSemaphores = [&](const std::shared_ptr<PrivateTexture>& privateTexture) {
-@@ -202,20 +748,32 @@ void Indium::PrivateCommandBuffer::commit() {
+@@ -202,20 +773,32 @@ void Indium::PrivateCommandBuffer::commit() {
  		auto privateTexture = std::dynamic_pointer_cast<PrivateTexture>(texture);
  		const auto& presentSema = presentationSemaphores[i];
  
@@ -2690,7 +2714,7 @@ index 43f4a84..c1448da 100644
  		{
  			std::unique_lock lock(self->_mutex);
  			self->_completed = true;
-@@ -234,7 +792,51 @@ void Indium::PrivateCommandBuffer::commit() {
+@@ -234,7 +817,56 @@ void Indium::PrivateCommandBuffer::commit() {
  		// the handlers may have captured a reference to us (from their surrounding scope), so clear out handlers so those references go away
  		self->_scheduledHandlers.clear();
  		self->_completedHandlers.clear();
@@ -2722,7 +2746,12 @@ index 43f4a84..c1448da 100644
 +				item.waits.push_back(w);
 +			}
 +			item.signals = signalInfos;
-+			if (batch.items.empty()) batch.since = std::chrono::steady_clock::now();
++			if (batch.items.empty()) {
++				batch.since = std::chrono::steady_clock::now();
++				// wake the batch timer only when a window opens, not on every commit
++				batch.wakePending.store(true, std::memory_order_relaxed);
++				batch.wake.notify_one();
++			}
 +			for (const auto& sg: signalInfos) {
 +				if (sg.value == 0) continue;
 +				auto& v = batch.signaled[sg.semaphore];
@@ -2742,7 +2771,7 @@ index 43f4a84..c1448da 100644
  
  	commandBufferInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO;
  	commandBufferInfo.commandBuffer = _commandBuffer;
-@@ -252,23 +854,42 @@ void Indium::PrivateCommandBuffer::commit() {
+@@ -252,23 +884,42 @@ void Indium::PrivateCommandBuffer::commit() {
  	//        the Device constructor tries to choose command queues that support as many operations as possible, but it's possible
  	//        that a particular device only supports certain operations on certain queues (e.g. maybe it only supports transfer operations
  	//        on an exclusive queue that doesn't support graphics or compute).
@@ -2790,7 +2819,7 @@ index 43f4a84..c1448da 100644
  };
  
  void Indium::PrivateCommandBuffer::presentDrawable(std::shared_ptr<Drawable> drawable) {
-@@ -307,9 +928,12 @@ void Indium::PrivateCommandBuffer::addCompletedHandler(std::function<void(std::s
+@@ -307,9 +958,12 @@ void Indium::PrivateCommandBuffer::addCompletedHandler(std::function<void(std::s
  };
  
  void Indium::PrivateCommandBuffer::waitUntilCompleted() {
@@ -2903,7 +2932,7 @@ index 5f62ad0..5957bec 100644
  	DynamicVK::vkCmdBindDescriptorSets(buf->commandBuffer(), VK_PIPELINE_BIND_POINT_COMPUTE, _pso->layout(), 0, descriptorSets.size(), descriptorSets.data(), 0, nullptr);
  };
 diff --git a/src/indium/device.cpp b/src/indium/device.cpp
-index 322e186..2fc1e81 100644
+index 322e186..5a15abe 100644
 --- a/src/indium/device.cpp
 +++ b/src/indium/device.cpp
 @@ -1,4 +1,6 @@
@@ -3345,7 +3374,7 @@ index 322e186..2fc1e81 100644
  		funcInfo.bindings.insert(funcInfo.bindings.end(), info.bindings.begin(), info.bindings.end());
  		funcInfo.embeddedSamplers.insert(funcInfo.embeddedSamplers.end(), info.embeddedSamplers.begin(), info.embeddedSamplers.end());
  	}
-@@ -388,13 +704,19 @@ void Indium::PrivateDevice::pollEvents(uint64_t timeoutNanoseconds) {
+@@ -388,13 +704,22 @@ void Indium::PrivateDevice::pollEvents(uint64_t timeoutNanoseconds) {
  	// some extra logic to handle the case of multiple thread polling simultaneously
  	std::unique_lock pollingLock(_pollingMutex);
  
@@ -3356,8 +3385,11 @@ index 322e186..2fc1e81 100644
 -	const std::vector<std::function<void()>> callbacks = _eventLoopCallbacks;
 -
 -	lock.unlock();
-+	std::vector<VkSemaphore> semaphores;
-+	std::vector<uint64_t> values;
++	// Scratch reused across polls: this function is serialised by _pollingMutex, and with
++	// the ordered worker the poll wakes once per commit, so the four vectors below used to
++	// be reallocated ~26 times per frame (plus their element copies).
++	static thread_local std::vector<VkSemaphore> semaphores;
++	static thread_local std::vector<uint64_t> values;
 +	{
 +		std::unique_lock lock(_eventLoopMutex);
 +		// From here until the wait returns a caller must signal us: it is adding a
@@ -3372,7 +3404,7 @@ index 322e186..2fc1e81 100644
  
  	VkSemaphoreWaitInfo info {};
  	info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO;
-@@ -405,25 +727,22 @@ void Indium::PrivateDevice::pollEvents(uint64_t timeoutNanoseconds) {
+@@ -405,25 +730,23 @@ void Indium::PrivateDevice::pollEvents(uint64_t timeoutNanoseconds) {
  
  	auto result = DynamicVK::vkWaitSemaphores(_device, &info, timeoutNanoseconds);
  
@@ -3381,7 +3413,9 @@ index 322e186..2fc1e81 100644
 -		return;
 -	}
 -
- 	std::vector<size_t> readyIndices;
+-	std::vector<size_t> readyIndices;
++	static thread_local std::vector<size_t> readyIndices;
++	readyIndices.clear();
  
  	// now check which semaphores are ready
  	// (excluding 0 because that's the special event loop wakeup semaphore)
@@ -3408,7 +3442,7 @@ index 322e186..2fc1e81 100644
  		}
  	}
  
-@@ -431,33 +750,51 @@ void Indium::PrivateDevice::pollEvents(uint64_t timeoutNanoseconds) {
+@@ -431,33 +754,52 @@ void Indium::PrivateDevice::pollEvents(uint64_t timeoutNanoseconds) {
  	// and this method cannot be invoked concurrently by different threads,
  	// so we assume that the front portions of the vectors (the portions we copied
  	// earlier) remain the same.
@@ -3416,7 +3450,8 @@ index 322e186..2fc1e81 100644
 +	// The callbacks are moved out of the shared vectors instead of being copied: a
 +	// std::function here captures shared_ptrs, so copying the whole vector on every
 +	// wake was an allocation plus an atomic round trip per pending commit.
-+	std::vector<std::function<void()>> readyCallbacks;
++	static thread_local std::vector<std::function<void()>> readyCallbacks;
++	readyCallbacks.clear();
 +	readyCallbacks.reserve(readyIndices.size());
  
 -	lock.lock();
@@ -3469,7 +3504,7 @@ index 322e186..2fc1e81 100644
  	auto oldVal = _eventLoopWaitValues[0]++;
  
  	VkSemaphoreSignalInfo info {};
-@@ -468,21 +805,40 @@ void Indium::PrivateDevice::wakeupEventLoop() {
+@@ -468,21 +810,40 @@ void Indium::PrivateDevice::wakeupEventLoop() {
  };
  
  void Indium::PrivateDevice::waitForSemaphore(VkSemaphore semaphore, uint64_t targetValue, std::function<void()> callback) {
@@ -3518,7 +3553,7 @@ index 322e186..2fc1e81 100644
  	VkSemaphoreTypeCreateInfo typeInfo {};
  	typeInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO;
  	typeInfo.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
-@@ -505,7 +861,14 @@ Indium::TimelineSemaphore Indium::PrivateDevice::getTimelineSemaphore() {
+@@ -505,7 +866,14 @@ Indium::TimelineSemaphore Indium::PrivateDevice::getTimelineSemaphore() {
  };
  
  void Indium::PrivateDevice::putTimelineSemaphore(const TimelineSemaphore& semaphore) {
@@ -3534,7 +3569,7 @@ index 322e186..2fc1e81 100644
  };
  
  std::shared_ptr<Indium::TimelineSemaphore> Indium::PrivateDevice::getWrappedTimelineSemaphore() {
-@@ -551,3 +914,160 @@ std::shared_ptr<Indium::BinarySemaphore> Indium::PrivateDevice::getWrappedBinary
+@@ -551,3 +919,160 @@ std::shared_ptr<Indium::BinarySemaphore> Indium::PrivateDevice::getWrappedBinary
  		delete ptr;
  	});
  };
@@ -3865,7 +3900,7 @@ index d56a213..66a6019 100644
 +
 +const std::vector<Iridium::ArgumentInfo>& Indium::PrivateFunction::argumentInfo() const { return _functionInfo.arguments; }
 diff --git a/src/indium/render-command-encoder.cpp b/src/indium/render-command-encoder.cpp
-index b27ffe5..dd7434d 100644
+index b27ffe5..db80878 100644
 --- a/src/indium/render-command-encoder.cpp
 +++ b/src/indium/render-command-encoder.cpp
 @@ -1,3 +1,8 @@
@@ -4217,7 +4252,7 @@ index b27ffe5..dd7434d 100644
  };
  
  void Indium::PrivateRenderCommandEncoder::setFrontFacingWinding(Winding frontFaceWinding) {
-@@ -225,6 +389,7 @@ void Indium::PrivateRenderCommandEncoder::setDepthClipMode(DepthClipMode depthCl
+@@ -225,13 +389,24 @@ void Indium::PrivateRenderCommandEncoder::setDepthClipMode(DepthClipMode depthCl
  	}
  };
  
@@ -4225,7 +4260,25 @@ index b27ffe5..dd7434d 100644
  void Indium::PrivateRenderCommandEncoder::setViewport(const Viewport& viewport) {
  	setViewports(&viewport, 1);
  };
-@@ -239,7 +404,7 @@ void Indium::PrivateRenderCommandEncoder::setViewports(const Viewport* viewports
+ 
+ void Indium::PrivateRenderCommandEncoder::setViewports(const Viewport* viewports, size_t count) {
+ 	auto buf = _privateCommandBuffer.lock();
+-	std::vector<VkViewport> tmp;
++	// beginPass() calls this (and setScissorRects) for every render pass, and the game
++	// sets one viewport at a time: the former std::vector was a heap allocation (through
++	// the allocator the game replaces, which takes a mutex) on every call. Build the
++	// common small counts on the stack; only a genuinely large array goes to the heap.
++	std::array<VkViewport, 8> inlineViews;
++	std::vector<VkViewport> heapViews;
++	VkViewport* tmp = inlineViews.data();
++	if (count > inlineViews.size()) {
++		heapViews.resize(count);
++		tmp = heapViews.data();
++	}
+ 	for (size_t i = 0; i < count; ++i) {
+ 		const auto& viewport = viewports[i];
+ 		VkViewport vkViewport {};
+@@ -239,7 +414,7 @@ void Indium::PrivateRenderCommandEncoder::setViewports(const Viewport* viewports
  		//       so we use a Vulkan 1.1 feature here and just flip the Y-axis of the viewport
  		//       (with a corresponding change in the origin).
  		vkViewport.x = viewport.originX;
@@ -4234,23 +4287,48 @@ index b27ffe5..dd7434d 100644
  		vkViewport.width = viewport.width;
  		vkViewport.height = -viewport.height;
  		// the documentation for setViewport and setViewports states that znear and zfar must be between
-@@ -251,6 +416,7 @@ void Indium::PrivateRenderCommandEncoder::setViewports(const Viewport* viewports
+@@ -249,9 +424,10 @@ void Indium::PrivateRenderCommandEncoder::setViewports(const Viewport* viewports
+ 		// with clamping or without clamping (which is only possible with VK_EXT_depth_range_unrestricted enabled).
+ 		vkViewport.minDepth = std::clamp(viewport.znear, 0., 1.);
  		vkViewport.maxDepth = std::clamp(viewport.zfar, 0., 1.);
- 		tmp.push_back(vkViewport);
+-		tmp.push_back(vkViewport);
++		tmp[i] = vkViewport;
  	}
-+	if (GpuTiming::enabled() && !tmp.empty()) seqLog("  VP %.0f %.0f %.0f %.0f\n", tmp[0].x, tmp[0].y, tmp[0].width, tmp[0].height);
- 	DynamicVK::vkCmdSetViewportWithCount(buf->commandBuffer(), tmp.size(), tmp.data());
+-	DynamicVK::vkCmdSetViewportWithCount(buf->commandBuffer(), tmp.size(), tmp.data());
++	if (GpuTiming::enabled() && count) seqLog("  VP %.0f %.0f %.0f %.0f\n", tmp[0].x, tmp[0].y, tmp[0].width, tmp[0].height);
++	DynamicVK::vkCmdSetViewportWithCount(buf->commandBuffer(), count, tmp);
  };
  
-@@ -274,6 +440,7 @@ void Indium::PrivateRenderCommandEncoder::setScissorRects(const ScissorRect* sci
+ void Indium::PrivateRenderCommandEncoder::setViewports(const std::vector<Viewport>& viewports) {
+@@ -264,7 +440,13 @@ void Indium::PrivateRenderCommandEncoder::setScissorRect(const ScissorRect& scis
+ 
+ void Indium::PrivateRenderCommandEncoder::setScissorRects(const ScissorRect* scissorRects, size_t count) {
+ 	auto buf = _privateCommandBuffer.lock();
+-	std::vector<VkRect2D> tmp;
++	std::array<VkRect2D, 8> inlineRects;
++	std::vector<VkRect2D> heapRects;
++	VkRect2D* tmp = inlineRects.data();
++	if (count > inlineRects.size()) {
++		heapRects.resize(count);
++		tmp = heapRects.data();
++	}
+ 	for (size_t i = 0; i < count; ++i) {
+ 		const auto& scissorRect = scissorRects[i];
+ 		VkRect2D vkRect {};
+@@ -272,9 +454,10 @@ void Indium::PrivateRenderCommandEncoder::setScissorRects(const ScissorRect* sci
+ 		vkRect.offset.y = scissorRect.y;
+ 		vkRect.extent.width = scissorRect.width;
  		vkRect.extent.height = scissorRect.height;
- 		tmp.push_back(vkRect);
+-		tmp.push_back(vkRect);
++		tmp[i] = vkRect;
  	}
-+	if (GpuTiming::enabled() && !tmp.empty()) seqLog("  SC %d %d %u %u\n", tmp[0].offset.x, tmp[0].offset.y, tmp[0].extent.width, tmp[0].extent.height);
- 	DynamicVK::vkCmdSetScissorWithCount(buf->commandBuffer(), tmp.size(), tmp.data());
+-	DynamicVK::vkCmdSetScissorWithCount(buf->commandBuffer(), tmp.size(), tmp.data());
++	if (GpuTiming::enabled() && count) seqLog("  SC %d %d %u %u\n", tmp[0].offset.x, tmp[0].offset.y, tmp[0].extent.width, tmp[0].extent.height);
++	DynamicVK::vkCmdSetScissorWithCount(buf->commandBuffer(), count, tmp);
  };
  
-@@ -287,43 +454,217 @@ void Indium::PrivateRenderCommandEncoder::setBlendColor(float red, float green,
+ void Indium::PrivateRenderCommandEncoder::setScissorRects(const std::vector<ScissorRect>& scissorRects) {
+@@ -287,43 +470,217 @@ void Indium::PrivateRenderCommandEncoder::setBlendColor(float red, float green,
  	DynamicVK::vkCmdSetBlendConstants(buf->commandBuffer(), tmp);
  };
  
@@ -4486,7 +4564,7 @@ index b27ffe5..dd7434d 100644
  	auto buf = _privateCommandBuffer.lock();
  
  	// bind the pipeline with the right topology class for this primitive
-@@ -343,20 +684,26 @@ void Indium::PrivateRenderCommandEncoder::drawPrimitives(PrimitiveType primitive
+@@ -343,20 +700,26 @@ void Indium::PrivateRenderCommandEncoder::drawPrimitives(PrimitiveType primitive
  		default:
  			throw BadEnumValue();
  	}
@@ -4519,7 +4597,7 @@ index b27ffe5..dd7434d 100644
  };
  
  void Indium::PrivateRenderCommandEncoder::drawPrimitives(PrimitiveType primitiveType, size_t vertexStart, size_t vertexCount, size_t instanceCount) {
-@@ -368,22 +715,42 @@ void Indium::PrivateRenderCommandEncoder::drawPrimitives(PrimitiveType primitive
+@@ -368,22 +731,42 @@ void Indium::PrivateRenderCommandEncoder::drawPrimitives(PrimitiveType primitive
  };
  
  void Indium::PrivateRenderCommandEncoder::setVertexBytes(const void* bytes, size_t length, size_t index) {
@@ -4565,7 +4643,7 @@ index b27ffe5..dd7434d 100644
  	}
  };
  
-@@ -391,12 +758,14 @@ void Indium::PrivateRenderCommandEncoder::setVertexBufferOffset(size_t offset, s
+@@ -391,12 +774,14 @@ void Indium::PrivateRenderCommandEncoder::setVertexBufferOffset(size_t offset, s
  	_functionResources[0].setBufferOffset(offset, index);
  };
  
@@ -4582,7 +4660,7 @@ index b27ffe5..dd7434d 100644
  };
  
  void Indium::PrivateRenderCommandEncoder::setVertexSamplerStates(const std::vector<std::shared_ptr<SamplerState>>& states, Range<size_t> range) {
-@@ -411,28 +780,34 @@ void Indium::PrivateRenderCommandEncoder::setVertexSamplerStates(const std::vect
+@@ -411,28 +796,34 @@ void Indium::PrivateRenderCommandEncoder::setVertexSamplerStates(const std::vect
  	}
  };
  
@@ -4621,7 +4699,7 @@ index b27ffe5..dd7434d 100644
  	}
  };
  
-@@ -440,12 +815,14 @@ void Indium::PrivateRenderCommandEncoder::setFragmentBufferOffset(size_t offset,
+@@ -440,12 +831,14 @@ void Indium::PrivateRenderCommandEncoder::setFragmentBufferOffset(size_t offset,
  	_functionResources[1].setBufferOffset(offset, index);
  };
  
@@ -4638,7 +4716,7 @@ index b27ffe5..dd7434d 100644
  };
  
  void Indium::PrivateRenderCommandEncoder::setFragmentSamplerStates(const std::vector<std::shared_ptr<SamplerState>>& states, Range<size_t> range) {
-@@ -460,17 +837,22 @@ void Indium::PrivateRenderCommandEncoder::setFragmentSamplerStates(const std::ve
+@@ -460,17 +853,22 @@ void Indium::PrivateRenderCommandEncoder::setFragmentSamplerStates(const std::ve
  	}
  };
  
@@ -4664,7 +4742,7 @@ index b27ffe5..dd7434d 100644
  	auto buf = _privateCommandBuffer.lock();
  
  	// bind the pipeline with the right topology class for this primitive
-@@ -490,39 +872,62 @@ void Indium::PrivateRenderCommandEncoder::drawIndexedPrimitives(PrimitiveType pr
+@@ -490,39 +888,62 @@ void Indium::PrivateRenderCommandEncoder::drawIndexedPrimitives(PrimitiveType pr
  		default:
  			throw BadEnumValue();
  	}
@@ -4745,7 +4823,170 @@ index b27ffe5..dd7434d 100644
  	DynamicVK::vkCmdSetDepthWriteEnable(buf->commandBuffer(), desc.depthWriteEnabled ? VK_TRUE : VK_FALSE);
  	DynamicVK::vkCmdSetDepthCompareOp(buf->commandBuffer(), compareFunctionToVkCompareOp(desc.depthCompareFunction));
  	DynamicVK::vkCmdSetDepthTestEnable(buf->commandBuffer(), VK_TRUE);
-@@ -694,3 +1099,18 @@ void Indium::PrivateRenderCommandEncoder::useResources(const std::vector<std::sh
+@@ -591,106 +1012,121 @@ void Indium::PrivateRenderCommandEncoder::setVisibilityResultMode(VisibilityResu
+ 	throw std::runtime_error("TODO: support visibility results");
+ };
+ 
+-void Indium::PrivateRenderCommandEncoder::useResource(std::shared_ptr<Resource> resource, ResourceUsage usage, RenderStages stages) {
+-	useResources({ resource }, usage, stages);
+-};
+-
+-void Indium::PrivateRenderCommandEncoder::useResources(const std::vector<std::shared_ptr<Resource>>& resources, ResourceUsage usage, RenderStages stages) {
++namespace {
++// The old form materialized a one-element std::vector for every useResource and two
++// more vectors for the barriers, then batched everything into a single
++// vkCmdPipelineBarrier. The deferred encoder already replays one useResource per
++// resource (and useResources as one op per resource), so per-resource barriers are
++// what the real game path already produces; issuing them directly removes four
++// allocations per call without changing the set of barriers.
++void issueResourceBarrier(VkCommandBuffer commandBuffer, const std::shared_ptr<Indium::Resource>& resource,
++		Indium::ResourceUsage usage, Indium::RenderStages stages) {
+ 	// TODO: image layout transitions. maybe.
+ 	//       right now, we always keep images in the layout described by their imageLayout() method.
+ 	//       we only briefly transition them away for an operation and then transition them back.
+ 	//       however, these transitions are probably unnecessary in most cases, so we could optimize
+ 	//       performance by getting rid of them.
+ 
+-	auto buf = _privateCommandBuffer.lock();
+-
+-	std::vector<VkBufferMemoryBarrier> bufferBarriers;
+-	std::vector<VkImageMemoryBarrier> imageBarriers;
+-
+ 	// TODO: relax this mask, maybe; it depends on what Metal does here.
+ 	VkAccessFlags source = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+ 	VkAccessFlags dest = VK_ACCESS_NONE;
+ 
+-	if (!!(usage & (ResourceUsage::Read | ResourceUsage::Sample))) {
++	if (!!(usage & (Indium::ResourceUsage::Read | Indium::ResourceUsage::Sample))) {
+ 		dest |= VK_ACCESS_SHADER_READ_BIT;
+ 	}
+ 
+-	if (!!(usage & ResourceUsage::Write)) {
++	if (!!(usage & Indium::ResourceUsage::Write)) {
+ 		dest |= VK_ACCESS_SHADER_WRITE_BIT;
+ 	}
+ 
+-	for (const auto& resource: resources) {
+-		if (auto buffer = std::dynamic_pointer_cast<PrivateBuffer>(resource)) {
+-			VkBufferMemoryBarrier barrier {};
+-
+-			barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+-			barrier.srcAccessMask = source;
+-			barrier.dstAccessMask = dest;
+-			barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+-			barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+-			barrier.buffer = buffer->buffer();
+-			barrier.offset = 0;
+-			barrier.size = VK_WHOLE_SIZE;
+-
+-			bufferBarriers.push_back(barrier);
+-		} else if (auto texture = std::dynamic_pointer_cast<PrivateTexture>(resource)) {
+-			VkImageMemoryBarrier barrier {};
+-
+-			barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+-			barrier.srcAccessMask = source;
+-			barrier.dstAccessMask = dest;
+-			barrier.oldLayout = texture->imageLayout();
+-			barrier.newLayout = barrier.oldLayout;
+-			barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+-			barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+-			barrier.image = texture->image();
+-			barrier.subresourceRange.aspectMask = pixelFormatToVkImageAspectFlags(texture->pixelFormat());
+-			barrier.subresourceRange.baseMipLevel = 0;
+-			barrier.subresourceRange.levelCount = texture->mipmapLevelCount();
+-			barrier.subresourceRange.baseArrayLayer = 0;
+-			barrier.subresourceRange.layerCount = texture->vulkanArrayLength();
+-
+-			imageBarriers.push_back(barrier);
+-		} else {
+-			throw std::runtime_error("Unsupported resource");
+-		}
+-	}
+-
+ 	// TODO: relax this, maybe, depending on what Metal does.
+ 	VkPipelineStageFlags srcStages = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+ 	VkPipelineStageFlags dstStages = VK_PIPELINE_STAGE_NONE;
+ 
+-	if (!!(stages & RenderStages::Vertex)) {
++	if (!!(stages & Indium::RenderStages::Vertex)) {
+ 		dstStages |= VK_PIPELINE_STAGE_VERTEX_SHADER_BIT;
+ 	}
+ 
+-	if (!!(stages & RenderStages::Fragment)) {
++	if (!!(stages & Indium::RenderStages::Fragment)) {
+ 		dstStages |= VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+ 	}
+ 
+-	if (!!(stages & RenderStages::Tile)) {
++	if (!!(stages & Indium::RenderStages::Tile)) {
+ 		// XXX: not sure about this one
+ 		dstStages |= VK_PIPELINE_STAGE_TESSELLATION_CONTROL_SHADER_BIT;
+ 	}
+ 
+-	if (!!(stages & RenderStages::Object)) {
+-		// ???
+-	}
+-
+-	if (!!(stages & RenderStages::Mesh)) {
++	if (!!(stages & Indium::RenderStages::Mesh)) {
+ 		// not yet defined on all platforms as 'EXT' instead of 'NV'
+-		//dstStages |= VK_PIPELINE_STAGE_MESH_SHADER_BIT_EXT;
+ 		dstStages |= VK_PIPELINE_STAGE_MESH_SHADER_BIT_NV;
+ 	}
+ 
+-	DynamicVK::vkCmdPipelineBarrier(buf->commandBuffer(), srcStages, dstStages, 0, 0, nullptr, bufferBarriers.size(), bufferBarriers.data(), imageBarriers.size(), imageBarriers.data());
++	if (auto buffer = std::dynamic_pointer_cast<Indium::PrivateBuffer>(resource)) {
++		VkBufferMemoryBarrier barrier {};
++		barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
++		barrier.srcAccessMask = source;
++		barrier.dstAccessMask = dest;
++		barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++		barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++		barrier.buffer = buffer->buffer();
++		barrier.offset = 0;
++		barrier.size = VK_WHOLE_SIZE;
++		Indium::DynamicVK::vkCmdPipelineBarrier(commandBuffer, srcStages, dstStages, 0, 0, nullptr, 1, &barrier, 0, nullptr);
++	} else if (auto texture = std::dynamic_pointer_cast<Indium::PrivateTexture>(resource)) {
++		VkImageMemoryBarrier barrier {};
++		barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
++		barrier.srcAccessMask = source;
++		barrier.dstAccessMask = dest;
++		barrier.oldLayout = texture->imageLayout();
++		barrier.newLayout = barrier.oldLayout;
++		barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++		barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++		barrier.image = texture->image();
++		barrier.subresourceRange.aspectMask = Indium::pixelFormatToVkImageAspectFlags(texture->pixelFormat());
++		barrier.subresourceRange.baseMipLevel = 0;
++		barrier.subresourceRange.levelCount = texture->mipmapLevelCount();
++		barrier.subresourceRange.baseArrayLayer = 0;
++		barrier.subresourceRange.layerCount = texture->vulkanArrayLength();
++		Indium::DynamicVK::vkCmdPipelineBarrier(commandBuffer, srcStages, dstStages, 0, 0, nullptr, 0, nullptr, 1, &barrier);
++	} else {
++		throw std::runtime_error("Unsupported resource");
++	}
++}
++}
++
++void Indium::PrivateRenderCommandEncoder::useResource(std::shared_ptr<Resource> resource, ResourceUsage usage, RenderStages stages) {
++	auto buf = _privateCommandBuffer.lock();
++	issueResourceBarrier(buf->commandBuffer(), resource, usage, stages);
++};
++
++void Indium::PrivateRenderCommandEncoder::useResources(const std::vector<std::shared_ptr<Resource>>& resources, ResourceUsage usage, RenderStages stages) {
++	auto buf = _privateCommandBuffer.lock();
++	auto commandBuffer = buf->commandBuffer();
++	for (const auto& resource: resources) {
++		issueResourceBarrier(commandBuffer, resource, usage, stages);
++	}
+ };
+ 
+ void Indium::PrivateRenderCommandEncoder::useResource(std::shared_ptr<Resource> resource, ResourceUsage usage) {
+-	useResources({ resource }, usage);
++	useResource(std::move(resource), usage, RenderStages::Vertex | RenderStages::Fragment | RenderStages::Tile | RenderStages::Object | RenderStages::Mesh);
+ };
+ 
+ void Indium::PrivateRenderCommandEncoder::useResources(const std::vector<std::shared_ptr<Resource>>& resources, ResourceUsage usage) {
  	// TODO: check what Metal does in this case. this is just an educated guess
  	useResources(resources, usage, RenderStages::Vertex | RenderStages::Fragment | RenderStages::Tile | RenderStages::Object | RenderStages::Mesh);
  };

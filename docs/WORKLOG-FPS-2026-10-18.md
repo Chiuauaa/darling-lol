@@ -643,3 +643,43 @@ pooling and/or deferring the `vkDestroySemaphore` were deliberately left out: th
 release is safe only once the presentation wait has completed, and a wrong reuse hangs
 the present. The next capture should tell us whether the kernel time is
 `vkEndCommandBuffer`, `vkSignalSemaphore` or the queue lock.
+
+## Sixth session, 2026-10-19: another allocation/lock pass over the same worker
+
+A code-only audit of the hot paths (no new capture; the match2 trace above is the
+reference) removed allocations and lock acquisitions that the fifth-session numbers
+label as pure overhead at ~26 commits and ~600 encoder creations per frame:
+
+1. **`PrivateDevice::pollEvents` scratch is `thread_local`.** The poll wakes once per
+   commit, and each wake rebuilt four vectors (`semaphores`, `values`, `readyIndices`,
+   `readyCallbacks`), copying the whole pending-semaphore set twice. They are reused now,
+   cleared per call; the callback vector was already moved out, this only stops the
+   reallocation.
+2. **`setViewports` / `setScissorRects` use a stack array for the common counts.**
+   `beginPass()` calls both for every render pass and the game sets one at a time; the
+   former `std::vector` was a heap allocation (through the allocator the game replaces,
+   which takes a mutex) per call.
+3. **`useResource` / `useResources` issue their barriers directly.** The old form
+   materialized a one-element vector for every `useResource` and two more for the
+   barriers. The deferred encoder already replays one `useResource` per resource, so the
+   real path already produced per-resource barriers; this only drops the vectors. The
+   dropped `RenderStages::Object` arm was a no-op.
+4. **The submit-batch timer sleeps to the window deadline.** It used to wake every 500 µs,
+   take `graphicsQueueMutex` (which the worker holds through a whole submission) and test
+   the batch for emptiness — ~2000 acquisitions/s. It now blocks until a batch opens
+   (`wakePending`) and then sleeps until `since + 500 µs`, so it takes the lock twice per
+   window instead of continuously.
+5. **`/tmp/metal-async-no-frame-sync` is cached.** It was an `access()` (a Darling RPC) on
+   every presenting commit, i.e. in the frame's critical path; now re-read every 256
+   commits like the other diagnostic flags.
+6. **`commit()` root sets are `thread_local`** and `rootTexture` takes its argument by
+   const reference instead of copying the `shared_ptr` per texture.
+
+These are all conservative: they change neither the submission order nor the set of
+Vulkan calls. The point is to shrink the worker's per-commit fixed cost, whose kernel
+share (0.459 core) the section timers should now attribute.
+
+Still deliberately not done: framebuffer caching (26 `vkCreateFramebuffer`/`vkDestroyFramebuffer`
+per frame). It is a real per-pass cost, but evicting a cached framebuffer safely needs
+GPU-completion tracking (the retirement queue is not GPU-aware) and holding the
+attachments alive — too risky to land without a measurement.
