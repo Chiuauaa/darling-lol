@@ -152,6 +152,19 @@ libraries.
 
 ## Handoff log
 
+- 2026-10-19 (coordinator, 12:55): delivered one cross-session message to each of
+  the four sessions via `opencode run -s` (queued as a user turn; no build, no
+  install, no game start requested). Replies: author session registered its
+  bisect state and corrected the build-id table (md5, not sha256); telemetry
+  session reported H4/H1 hunks written and validated (`prepare.py --check-only`
+  30/30, `validate.py` PASS) and will capture after the bisect frees the game
+  start; reviewer session confirmed it stays strictly static; GPU session had
+  already applied three hunks to `patches/metal--deps--indium.patch`
+  (`presentationSemaphores` and `extraWaitSemaphores` → `static thread_local`,
+  one `dynamic_pointer_cast` → `else if`) before the freeze arrived and has not
+  built, installed or tested them. The message-delivery conventions are now in
+  `AGENTS.md` (*Coordinating parallel sessions*).
+
 - 2026-10-19 (cross-reference): merged the state of the four concurrent sessions
   into this file; flagged the `patches/indium.patch` collision, the duplicated
   `24f7f7b` items, and the single-game-start ordering. No code change.
@@ -196,3 +209,24 @@ libraries.
     the pre-5ª files — `device.cpp` `f939e544…`, `command-buffer.cpp`
     `8dece49e…`, `render-command-encoder.cpp` `76458c6f…`. The 6ª versions are
     saved in `/tmp/six/src/indium/`.
+- 2026-10-19 (reviewer session, static RE of `mvg` surface): closed the static
+  list for the runtime `H1IOKIT`/`H4SYSCTL` cross-check. **IOKit** — exactly one
+  `IOServiceMatching`, and the obfuscated class name decrypts to
+  `IOPlatformExpertDevice` (`plain[i] = cipher[i] XOR key[i % 17]`, key
+  `a1 6d cb 03 11 59 c9 54 1d 5a 4c a9 14 4a 27 55 65`, blob at `0x11EF4A0`;
+  the same buffer also holds the fallback `unknown`); one
+  `IOServiceGetMatchingService`; **two** `IORegistryEntryCreateCFProperty` sites
+  whose key names use a *second* decryptor not reversed yet (not the 17-byte
+  keystream); one each of `IORegistryGetRootEntry`,
+  `IORegistryEntryCreateIterator`, `IORegistryEntryGetPath`; one
+  `KextManagerCopyLoadedKextInfo` (Darling returns NULL — no `kextd` /
+  `com.apple.KernelExtensionServer`); one `IOCreatePlugInInterfaceForService`
+  (synthetic services have no `kIOCFPlugInTypesKey` factory →
+  `kIOReturnUnsupported`). `kIOMainPortDefault` is `weak_import`; the rest bind
+  strong and resolve. **sysctl** (proven by `sysctlbyname("…")` format strings):
+  `hw.physicalcpu_max`, `hw.logicalcpu_max`, `hw.packages`, `hw.cacheconfig`
+  (`vfs.usermount` is also present but likely from a bundled library, not Vanguard
+  code). The runtime `H1IOKIT`/`H4SYSCTL` lines should be diffed against this:
+  the two property keys and any extra sysctl names are the deliverable. Strictly
+  static: no runtime armed, no game start, no `patches/` touched, Vanguard
+  untouched.
