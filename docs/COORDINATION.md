@@ -121,6 +121,36 @@ frame) from measured cost, and design — not code — the two-worker replay.
 Sequencing of game starts stands: (1) bisect with `session5-clean`, (2) telemetry
 `/tmp/darling-hw-trace` capture, (3) FPS/timing capture.
 
+### Update 13:08 (-03) — coordinator, correcting the 13:02 note
+
+The GPU session measured the two things the 13:02 note had left as candidates.
+Results, which supersede that note:
+
+- **Framebuffer cache is not a lever.** `vkCreateFramebuffer` + `vkDestroyFramebuffer`
+  costs 0.10 µs wall / 0.06 µs CPU per pair on driver 580 (microbench
+  `build/fps-diag/vk-kernel-bench`, host GPU): ~2.6 µs/frame at ~26 passes. Removed
+  from the queue; it was the one item the 13:02 note had kept "until measured".
+- **There is no core to give a second replay worker.** In the same match the game
+  used 0.94 core (worker 0.65 + main 0.265 + poll/batch 0.03), and the box sat at
+  ~3.7 of 4 threads: the Riot client's Chromium helpers ~1.7 core, `darlingserver`
+  ~0.3, desktop ~0.3. Free headroom: **~0.25 core**. Parallel replay is therefore
+  not a viable next step on this host; the main thread blocked in `drain@commit`
+  frees nothing (it is blocked, not idle-CPU).
+- **Replay units are ~22/frame.** `encCreate ≈ 0.92 × commits`, one render pass per
+  command buffer, so batching (which merges submits, not replay units) is worth
+  only ~1.09× (28 → ~30 FPS). 60 FPS at the measured ~664 commits/s ceiling needs
+  `commits/frame ≤ 11`, which only command-buffer merging — a synchronization-model
+  change — can produce.
+- **Per-commit attribution is still open.** The only per-commit suspect with a
+  counter is the binary semaphore (0.054 core); ~0.45 core of the worker's `sys`
+  is unattributed because that capture had no `phases@` lines. The gating
+  measurement is one `/tmp/metal-debug-timing` capture with those sections armed.
+
+Revised queue for the implementer: (1) close the bisect, (2) land or drop the
+7th-session hunks as their own commit, (3) the `phases@` timing capture — this is
+what decides the next move, (4) only then choose between reclaiming non-game CPU
+and merging command buffers, (5) framebuffer cache dropped.
+
 ### Who holds which shared resource
 
 - **`RuntimeLibraries/libindium.dylib` + the indium overlay**: held by the author
@@ -166,6 +196,38 @@ Sequencing of game starts stands: (1) bisect with `session5-clean`, (2) telemetr
   `H1IOKIT` lines should be posted back into this file and cross-checked against
   those keys — that diff is the deliverable, not either half alone.
 
+### Graphics-API research consolidated (2026-10-19, research session)
+
+A standalone reference now lives in [`docs/GRAPHICS-STACK.md`](GRAPHICS-STACK.md): the
+API model of OpenGL / Vulkan / Metal side by side, the five translation layers in play
+and **which direction each one runs**, Darling's Mach-O -> ELF bridge (`mldr`,
+`wrapgen`) as the reason host EGL/X11 is reachable at all, the two present paths in this
+tree, and the Vulkan/GL external-object handoff used to present a Metal frame. It is
+read-only knowledge: no patch, no overlay and no game-start policy changed.
+
+What it changes for the sessions already in flight (each item is *context*, not a new
+task, and none of them arms a flag or starts a game):
+
+- **Implementer of record / indium bisect.** The measured cost of the frame path
+  (`indium-submit` ~0.53 core of *kernel* time, `drain@commit` on the presenter) is the
+  expected cost of replaying Metal's serialized encoder order into Vulkan, i.e. driver
+  entries and submissions, not allocation or compute. The two mechanisms that attack it
+  are the open items already on the list — framebuffer cache first, parallel replay
+  last — and, on the presentation boundary, timeline semaphores (`MTLSharedEvent`-style
+  counter waits) instead of a binary semaphore created and destroyed per commit. That
+  last one is a *design* note; it is not a request to add a hunk while the bisect is open.
+- **GPU frame-path session.** Indium requires Vulkan 1.3 or
+  `VK_EXT_extended_dynamic_state`/`2` plus timeline semaphores, and it is the mirror of
+  MoltenVK: shaders travel Metal/AIR -> SPIR-V through Iridium, so a shader bug surfaces
+  as an Iridium translation issue, not a SPIR-V-to-MSL one. The MoltenVK guide's
+  three-swapchain-images limit is the external confirmation of why a drawable that is
+  not recycled in time produces `Metal Device timed out`.
+- **Telemetry session.** Nothing to add at run time from this research; the H4/H1
+  surface is unrelated to the graphics API model.
+- **Reviewer session.** `winevulkan` is the closest solved analogue to Indium and
+  documents the two traps worth mirroring in review: dispatchable handles must be
+  wrapped, and struct layouts must be converted, not memcpy'd.
+
 ### Conflicts and hazard rules
 
 - Do not add indium changes while the black-screen/`sig=6` bisect is open: every
@@ -195,6 +257,16 @@ Sequencing of game starts stands: (1) bisect with `session5-clean`, (2) telemetr
 4. Keep the tooling refactor commits (reviewer session) independent of all three.
 
 ## Handoff log
+
+- 2026-10-19 (research session): added `docs/GRAPHICS-STACK.md`, a consolidated
+  reference for how OpenGL, Vulkan and Metal work and where each translation layer sits
+  (MoltenVK backwards, Indium forwards, DXVK/vkd3d-proton, wined3d, ANGLE), together
+  with the Darling ELF-bridge and overlay-restart constraints and the two present paths
+  in this tree. Sources are primary (Khronos/MoltenVK docs, `darlinghq/indium`,
+  darling-docs internals, Wine `winevulkan`/`winex11.drv`/`wined3d` sources, Proton,
+  DXVK, vkd3d-proton, ANGLE). **No code, patch, overlay or runtime change**; the
+  indium freeze, the one-knob-per-game-start rule and the game-start queue are
+  untouched. Cross-referenced from the *Cross-session synthesis* section.
 
 - 2026-10-19 (coordinator, 12:55): delivered one cross-session message to each of
   the four sessions via `opencode run -s` (queued as a user turn; no build, no
