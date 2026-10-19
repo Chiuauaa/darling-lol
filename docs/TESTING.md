@@ -326,6 +326,33 @@ HOST_SYSCTL_CPU pass=1 mode=optout ncpu=8 active=8 logicalcpu=8 logicalcpu_max=8
 
 The commpage fields the same change publishes (`_COMM_PAGE_NCPUS`, `_COMM_PAGE_ACTIVE_CPUS`, `_COMM_PAGE_PHYSICAL_CPUS`, `_COMM_PAGE_LOGICAL_CPUS` and the `kNumCPUs` capability bits) come from mldr. `build/riot-mldr` is the rebuilt loader; activating it means replacing the root-owned SDK copy (`/usr/local/libexec/darling/usr/libexec/darling/mldr`) after exiting clients and shutting down Darling, as in the setup notes.
 
+## Hardware/IOKit compatibility trace (H4/H1)
+
+The opt-in trace in `patches/xnu.patch` (sysctl dispatcher) and `patches/iokitd.patch` (IORegistry) validates as a normal patch and never changes what the layer returns:
+
+```sh
+python3 scripts/prepare.py --check-only
+```
+
+Expected: `All 30 component patches validated`. To exercise it, build and install the two components after `darling shutdown`:
+
+```sh
+cmake --build build/darling-src/build --target iokitd --parallel 3
+sudo install -m755 build/darling-src/build/src/external/iokitd/iokitd \
+  /usr/local/libexec/darling/usr/sbin/iokitd
+# libsystem_kernel is rebuilt and installed by the per-user memory runtime installer
+python3 tools/install-riot-memory-runtime.py
+```
+
+Then create the guest flag while Darling is stopped, start the namespace and the game once, since `iokitd` and each guest process read it only once:
+
+```sh
+touch ~/.darling/private/tmp/darling-hw-trace   # the guest /tmp while Darling is stopped
+sh scripts/run.sh
+```
+
+Read the capture with `darling shell cat /tmp/darling-hw-trace.log`; lines are `H4SYSCTL key=… op=… rv=… len=… value=…` and `H1IOKIT caller=<pid> op=… …`. The same probe binaries must print identical results with the flag present and absent — the capture adds lines, never values. `kern.proc`/`kern.procargs2` must always read `value=<redacted>`, since argv/environ can carry authentication tokens. Arm this trace alone, never together with a `/tmp/metal-*` knob, per the one-toggle-per-game rule.
+
 ## Optimized library overlays and string primitives
 
 The string primitives the guest resolves to are checked on the host against two copies of the same libplatform sources, a byte-loop reference, and an unmapped page on each side of every buffer:
@@ -480,6 +507,13 @@ every 5 s. The overlay lives outside the tree and is never committed to
    `/tmp/metal-op-timing` instrument) for the per-op replay breakdown.
 4. Restore the stock `libindium` when done. Never arm an experimental knob together
    with a diagnostic: one knob per game start (see [AGENTS.md](../AGENTS.md)).
+
+Steps 2–3 are now one tracked entry point, `tools/fps_diag.py`: `perframe`, `optime`
+and `thread-prof` are self-contained and read-only, `report` runs `perframe`+`optime`
+together, and `arm-counters`/`restore`/`collect-match` **delegate** to the capture
+recipes in `build/fps-diag` (`FPS_DIAG_DIR` overrides the directory). The historical
+`python3 build/fps-diag/<script>.py` invocations still work: those files are thin
+shims over the entry point.
 
 On 2026-10-19 this recipe showed `indium-submit` at ~0.55 core, ~0.53 of it kernel
 time, ~0 minor page faults and `State: R`, while `vkQueueSubmit2` averaged 0.0 ms.

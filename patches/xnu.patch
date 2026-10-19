@@ -6074,3 +6074,296 @@ index 0000000..f185f6c
 +__sysctlbyname:
 +    /* Just jump to the syscall stub */
 +    jmp ___sysctlbyname
+
+diff --git a/darling/src/libsystem_kernel/emulation/include/xnu_syscall/bsd/impl/misc/sysctl_trace.h b/darling/src/libsystem_kernel/emulation/include/xnu_syscall/bsd/impl/misc/sysctl_trace.h
+new file mode 100644
+--- /dev/null
++++ b/darling/src/libsystem_kernel/emulation/include/xnu_syscall/bsd/impl/misc/sysctl_trace.h
+@@ -0,0 +1,72 @@
++#ifndef DARLING_SYSCTL_TRACE_H
++#define DARLING_SYSCTL_TRACE_H
++
++/*
++ * darling-lol H4: passive sysctl audit tracer.
++ *
++ * Enabled solely by the presence of the guest flag file /tmp/darling-hw-trace,
++ * checked once per process with access().  Each call is logged in full: the
++ * exact MIB/name, the resolved dotted key, the return value, the reported
++ * length and a typed rendering of the value.  The value bytes of the
++ * process-inspection keys (kern.proc, kern.procargs2) are strictly redacted,
++ * because argv/environ can carry authentication tokens.
++ *
++ * Nothing in here modifies an argument, a buffer, a length or a return value:
++ * the dispatcher copies its result into a local first and only then logs.
++ * With the flag file absent the only cost is the one cached access().
++ */
++
++#include <stdarg.h>
++
++#include <darling/emulation/common/base.h>
++#include <darling/emulation/common/simple.h>
++#include <darling/emulation/conversion/fcntl/open.h>
++#include <darling/emulation/linux_premigration/linux-syscalls/linux.h>
++#include <darling/emulation/xnu_syscall/bsd/impl/fcntl/open.h>
++#include <darling/emulation/xnu_syscall/bsd/impl/unistd/close.h>
++
++#define DARLING_HW_TRACE_FLAG "/tmp/darling-hw-trace"
++#define DARLING_HW_TRACE_LOG  "/tmp/darling-hw-trace.log"
++
++static inline int darling_hw_trace_enabled(void)
++{
++	static int state = -1;
++
++	if (state < 0)
++		state = (LINUX_SYSCALL(__NR_access, DARLING_HW_TRACE_FLAG, 0) == 0);
++	return state;
++}
++
++/* Cached once per process, so a line can be attributed to the caller even when
++ * several guest processes run with the trace armed. */
++static inline int darling_hw_trace_pid(void)
++{
++	static int pid = -1;
++
++	if (pid < 0)
++		pid = (int) LINUX_SYSCALL(__NR_getpid);
++	return pid;
++}
++
++static inline void darling_hw_trace(const char* format, ...)
++{
++	int fd;
++	va_list args;
++
++	if (!darling_hw_trace_enabled())
++		return;
++
++	fd = (int) sys_open(DARLING_HW_TRACE_LOG, BSD_O_WRONLY | BSD_O_CREAT | BSD_O_APPEND, 0644);
++	if (fd < 0)
++		return;
++
++	__simple_fprintf(fd, "H4SYSCTL pid=%d ", darling_hw_trace_pid());
++
++	va_start(args, format);
++	__simple_vfprintf(fd, format, args);
++	va_end(args);
++
++	close_internal(fd);
++}
++
++#endif // DARLING_SYSCTL_TRACE_H
+
+diff --git a/darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/impl/misc/sysctl.c b/darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/impl/misc/sysctl.c
+--- a/darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/impl/misc/sysctl.c
++++ b/darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/impl/misc/sysctl.c
+@@ -16,6 +16,9 @@
+ #include <darling/emulation/xnu_syscall/bsd/helper/misc/sysctl_net.h>
+ #include <darling/emulation/xnu_syscall/bsd/helper/misc/sysctl_vm.h>
+ 
++#include <darling/emulation/xnu_syscall/bsd/impl/misc/sysctl_trace.h>
++
++extern void* memcpy(void* dst, const void* src, __SIZE_TYPE__ n);
+ extern char *strchr(const char *s, int c);
+ extern int strncmp(const char *s1, const char *s2, __SIZE_TYPE__ n);
+ extern int strcmp(const char *s1, const char *s2);
+@@ -56,11 +59,124 @@
+ 		*out_len = len;
+ }
+ 
++/* darling-lol H4: resolve a MIB to its dotted key by walking the same table.
++ * Stops at the first unknown selector, so a failed lookup also shows the
++ * prefix that did resolve. */
++static void darling_sysctl_key_from_mib(const int* name, unsigned int nlen, char* out, int outsz)
++{
++	const struct known_sysctl* current = &sysctls_root;
++	int used = 0;
++	unsigned int i;
++
++	out[0] = '\0';
++
++	for (i = 0; i < nlen; i++)
++	{
++		int j;
++		const struct known_sysctl* next = NULL;
++
++		if (current->type != CTLTYPE_NODE)
++			break;
++
++		for (j = 0; current->subctls[j].oid != -1; j++)
++		{
++			if (current->subctls[j].oid == name[i])
++			{
++				next = &current->subctls[j];
++				break;
++			}
++		}
++
++		if (!next)
++			break;
++
++		used += __simple_snprintf(out + used, (outsz > used) ? (outsz - used) : 0,
++				used ? ".%s" : "%s", next->name);
++		if (used >= outsz)
++		{
++			out[outsz - 1] = '\0';
++			break;
++		}
++
++		current = next;
++	}
++}
++
++/* kern.proc/kern.procargs2 carry argv/environ, which can include tokens. */
++static int darling_sysctl_redact(const char* key)
++{
++	return (strcmp(key, "kern.proc") == 0 || strcmp(key, "kern.procargs2") == 0);
++}
++
++static void darling_sysctl_log_value(const char* key, const struct known_sysctl* leaf,
++		void* old, const unsigned long* oldlen, long rv)
++{
++	unsigned long len = (oldlen != NULL) ? *oldlen : 0;
++
++	if (rv != 0)
++	{
++		darling_hw_trace("key=%s op=get rv=%ld len=%lu\n", key, rv, len);
++		return;
++	}
++
++	if (old == NULL)
++	{
++		darling_hw_trace("key=%s op=probe rv=0 len=%lu\n", key, len);
++		return;
++	}
++
++	if (darling_sysctl_redact(key))
++	{
++		darling_hw_trace("key=%s op=get rv=0 len=%lu value=<redacted>\n", key, len);
++		return;
++	}
++
++	switch (leaf->type)
++	{
++		case CTLTYPE_INT:
++			if (len >= sizeof(int))
++			{
++				int v;
++				memcpy(&v, old, sizeof(v));
++				darling_hw_trace("key=%s op=get rv=0 len=%lu value=%d\n", key, len, v);
++				return;
++			}
++			break;
++		case CTLTYPE_QUAD:
++			if (len >= sizeof(unsigned long long))
++			{
++				unsigned long long v;
++				memcpy(&v, old, sizeof(v));
++				darling_hw_trace("key=%s op=get rv=0 len=%lu value=%llu\n", key, len, v);
++				return;
++			}
++			break;
++		case CTLTYPE_STRING:
++		{
++			char buf[65];
++			unsigned long n = (len < sizeof(buf) - 1) ? len : (sizeof(buf) - 1);
++			memcpy(buf, old, n);
++			buf[n] = '\0';
++			darling_hw_trace("key=%s op=get rv=0 len=%lu value=\"%s\"\n", key, len, buf);
++			return;
++		}
++		default:
++			break;
++	}
++
++	darling_hw_trace("key=%s op=get rv=0 len=%lu value=<opaque>\n", key, len);
++}
++
+ long sys_sysctl(int* name, unsigned int nlen, void* old,
+ 		unsigned long* oldlen, void* _new, unsigned long newlen)
+ {
+ 	int i;
+ 	const struct known_sysctl* current = &sysctls_root;
++	char key[128];
++
++	key[0] = '\0';
++	if (darling_hw_trace_enabled())
++		darling_sysctl_key_from_mib(name, nlen, key, sizeof(key));
+ 
+ 	// __simple_printf("sysctl %d,%d\n", name[0], name[1]);
+ 
+@@ -81,6 +197,7 @@
+ 		if (!next)
+ 		{
+ 			// __simple_printf("%d not found in %s\n", name[i], current->name);
++			darling_hw_trace("key=%s op=mib rv=-2 missing_oid=%d\n", key, name[i]);
+ 			return -ENOENT;
+ 		}
+ 
+@@ -92,10 +209,12 @@
+ 	if (current->type == CTLTYPE_NODE)
+ 	{
+ 		// __simple_printf("-->ISDIR: %s\n", current->name);
++		darling_hw_trace("key=%s op=mib rv=-21 node=1\n", key);
+ 		return -EISDIR;
+ 	}
+ 
+ 	long rv = current->handler(name, nlen, old, oldlen, _new, newlen);
++	darling_sysctl_log_value(key, current, old, oldlen, rv);
+ 	// __simple_printf("sysctl rv %d\n", rv);
+ 	return rv;
+ }
+@@ -107,11 +226,19 @@
+ 	char* saveptr;
+ 	const char* token;
+ 	char name_copy[128];
++	char key[128];
+ 	// __simple_printf("sysctlbyname: %s\n", name);
++
++	key[0] = '\0';
++	if (darling_hw_trace_enabled())
++		strlcpy(key, name, sizeof(key));
+ 
+ 	// Used by launchd, assumed to succeed
+ 	if (strcmp(name, "vfs.generic.noremotehang") == 0)
++	{
++		darling_hw_trace("key=%s op=name rv=0 special=noremotehang\n", key);
+ 		return 0;
++	}
+ 	
+ 	strlcpy(name_copy, name, sizeof(name_copy));
+ 	token = strtok_r(name_copy, ".", &saveptr);
+@@ -122,7 +249,10 @@
+ 		int i;
+ 
+ 		if (current->type != CTLTYPE_NODE)
++		{
++			darling_hw_trace("key=%s op=name rv=-20 missing_token=%s\n", key, token);
+ 			return -ENOTDIR;
++		}
+ 
+ 		for (i = 0; current->subctls[i].oid != -1; i++)
+ 		{
+@@ -136,6 +266,7 @@
+ 		if (next == NULL)
+ 		{
+ 			__simple_kprintf("sysctlbyname: unknown name %s", name);
++			darling_hw_trace("key=%s op=name rv=-2 missing_token=%s\n", key, token);
+ 			return -ENOENT;
+ 		}
+ 
+@@ -144,7 +275,12 @@
+ 	}
+ 
+ 	if (current->type == CTLTYPE_NODE)
++	{
++		darling_hw_trace("key=%s op=name rv=-21 node=1\n", key);
+ 		return -EISDIR;
+-
+-	return current->handler(NULL, 0, old, oldlen, _new, newlen);
+-}
++	}
++
++	long rv = current->handler(NULL, 0, old, oldlen, _new, newlen);
++	darling_sysctl_log_value(key, current, old, oldlen, rv);
++	return rv;
++}

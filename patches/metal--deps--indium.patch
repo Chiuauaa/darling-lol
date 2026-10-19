@@ -2584,7 +2584,8 @@ index 43f4a84..0735daf 100644
 +	// allocating four vectors per commit (~26 commits per frame).
 +	static thread_local std::vector<std::shared_ptr<Texture>> readOnlyTextures;
 +	static thread_local std::vector<std::shared_ptr<Texture>> readWriteTextures;
- 	std::vector<std::shared_ptr<BinarySemaphore>> presentationSemaphores;
+-	std::vector<std::shared_ptr<BinarySemaphore>> presentationSemaphores;
++	static thread_local std::vector<std::shared_ptr<BinarySemaphore>> presentationSemaphores;
 +	readOnlyTextures.clear();
 +	readWriteTextures.clear();
 +	presentationSemaphores.clear();
@@ -2596,7 +2597,7 @@ index 43f4a84..0735daf 100644
  		}
  
 -		// TODO: implement this for other encoders (we need to synchronize those texture accesses as well)
-+		if (auto blitEncoder = std::dynamic_pointer_cast<PrivateBlitCommandEncoder>(encoder)) {
++		else if (auto blitEncoder = std::dynamic_pointer_cast<PrivateBlitCommandEncoder>(encoder)) {
 +			// only the writes to drawables are tracked for now, so that blitting into a drawable is synchronized with its presentation
 +			auto& readWrite = blitEncoder->readWriteTextures();
 +			readWriteTextures.insert(readWriteTextures.end(), readWrite.begin(), readWrite.end());
@@ -2672,7 +2673,8 @@ index 43f4a84..0735daf 100644
  	signalInfos.push_back(signalEventLoopInfo);
  
 +	const double handlesStart = taskTiming ? indiumNow() : 0;
- 	std::vector<std::shared_ptr<BinarySemaphore>> extraWaitSemaphores;
+-	std::vector<std::shared_ptr<BinarySemaphore>> extraWaitSemaphores;
++	static thread_local std::vector<std::shared_ptr<BinarySemaphore>> extraWaitSemaphores; extraWaitSemaphores.clear();
  
  	const auto handleTextureSemaphores = [&](const std::shared_ptr<PrivateTexture>& privateTexture) {
 @@ -202,20 +773,32 @@ void Indium::PrivateCommandBuffer::commit() {

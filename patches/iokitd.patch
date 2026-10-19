@@ -3074,3 +3074,375 @@ index 7a6fcfa..26a7d68 100644
 +		m_changedDPMS = false;
  	}
  }
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -29,6 +29,7 @@
+ 	src/main.mm
+ 	src/stubs.c
+ 	src/stubs-powermanagement.c
++	src/IOTrace.c
+ 	src/iokitd.cpp
+ 	src/ServiceRegistry.mm
+ 	src/IOObject.cpp
+
+diff --git a/src/IORegistryEntry.mm b/src/IORegistryEntry.mm
+--- a/src/IORegistryEntry.mm
++++ b/src/IORegistryEntry.mm
+@@ -7,12 +7,22 @@
+ #include <IOKit/IOReturn.h>
+ #include <sstream>
+ #include "IOIterator.h"
++#include "IOTrace.h"
+ extern "C" {
+ #include "iokitmigServer.h"
+ }
+ 
+ #import <Foundation/NSString.h>
+ #import <Foundation/NSDictionary.h>
++
++// darling-lol H1: path of the entry a query resolved to (or failed on).  The
++// trace runs on the single IOKit dispatch queue, so a static buffer is fine.
++static const char* iotrace_entry_path(IORegistryEntry* e, const char* plane)
++{
++	static std::string path;
++	path = e->getPath((plane && plane[0]) ? plane : kIOServicePlane);
++	return path.c_str();
++}
+ 
+ uint64_t IORegistryEntry::m_nextId = 0x100000000;
+ std::unordered_map<uint64_t, IORegistryEntry*> IORegistryEntry::m_entriesById;
+@@ -405,11 +415,17 @@
+ 	}
+     
+ 	if (components.empty())
+-		return kIOReturnBadArgument;
++	{
++		iotrace_line("op=entry_from_path rv=0x%x bad_path path=%s", (unsigned) kIOReturnBadArgument, path);
++		return kIOReturnBadArgument;
++	}
+ 	
+ 	std::string& planeName = components[0];
+ 	if (planeName[planeName.length()-1] != ':')
+-		return kIOReturnBadArgument;
++	{
++		iotrace_line("op=entry_from_path rv=0x%x no_plane path=%s", (unsigned) kIOReturnBadArgument, path);
++		return kIOReturnBadArgument;
++	}
+ 	else
+ 		planeName.resize(planeName.length()-1); // remove the final colon
+ 
+@@ -429,9 +445,15 @@
+ 		}
+ 
+ 		if (!next)
++		{
++			iotrace_line("op=entry_from_path rv=0x%x notfound path=%s missing=%s",
++				(unsigned) kIOReturnNoDevice, path, components[i].c_str());
+ 			return kIOReturnNoDevice;
++		}
+ 		current = next;
+ 	}
++
++	iotrace_line("op=entry_from_path rv=0 class=%s path=%s", current->className(), path);
+ 
+ 	*registry_entry = current->port();
+ 
+@@ -487,7 +509,11 @@
+ 		retval = findKey(e, plane, propName);
+ 
+ 		if (!retval)
++		{
++			iotrace_line("op=entry_get_property rv=0x%x notfound class=%s path=%s plane=%s prop=%s recursive=1",
++				(unsigned) kIOReturnError, e->className(), iotrace_entry_path(e, plane), plane, property_name);
+ 			return kIOReturnError; // TODO: or another code?
++		}
+ 	}
+ 	else
+ 	{
+@@ -496,10 +522,18 @@
+ 		id value = [props objectForKey: propName];
+ 
+ 		if (!value)
++		{
++			iotrace_line("op=entry_get_property rv=0x%x notfound class=%s path=%s plane=%s prop=%s recursive=0",
++				(unsigned) kIOReturnError, e->className(), iotrace_entry_path(e, plane), plane, property_name);
+ 			return kIOReturnError; // TODO: or another code?
++		}
+ 
+ 		retval = @{ propName: value };
+ 	}
++
++	iotrace_line("op=entry_get_property rv=0 class=%s path=%s plane=%s prop=%s recursive=%d",
++		e->className(), iotrace_entry_path(e, plane), plane, property_name,
++		((options & kIORegistryIterateRecursively) && plane[0]) ? 1 : 0);
+ 
+ 	CFDataRef data = IOCFSerialize(retval, kIOCFSerializeToBinary);
+ 	*propertiesCnt = CFDataGetLength(data);
+@@ -542,7 +576,16 @@
+ 		value = [e->getProperties() objectForKey: propName];
+ 
+ 	if (!value)
++	{
++		iotrace_line("op=entry_get_property_buf rv=0x%x notfound class=%s path=%s plane=%s prop=%s options=0x%x recursive=%d",
++			(unsigned) kIOReturnNotFound, e->className(), iotrace_entry_path(e, plane), plane, property_name,
++			options, ((options & kIORegistryIterateRecursively) && plane[0]) ? 1 : 0);
+ 		return kIOReturnNotFound;
++	}
++
++	iotrace_line("op=entry_get_property_buf rv=0 class=%s path=%s plane=%s prop=%s options=0x%x recursive=%d",
++		e->className(), iotrace_entry_path(e, plane), plane, property_name, options,
++		((options & kIORegistryIterateRecursively) && plane[0]) ? 1 : 0);
+ 
+ 	// Unlike io_registry_entry_get_property_bin, the reply carries the value itself.
+ 	// The caller's buffer lives in another task, so always answer out-of-line, which the
+
+diff --git a/src/IOTrace.c b/src/IOTrace.c
+new file mode 100644
+--- /dev/null
++++ b/src/IOTrace.c
+@@ -0,0 +1,62 @@
++/*
++ This file is part of Darling.
++
++ Copyright (C) 2026 Darling developers
++
++ Darling is free software: you can redistribute it and/or modify
++ it under the terms of the GNU General Public License as published by
++ the Free Software Foundation, either version 3 of the License, or
++ (at your option) any later version.
++
++ Darling is distributed in the hope that it will be useful,
++ but WITHOUT ANY WARRANTY; without even the implied warranty of
++ MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ GNU General Public License for more details.
++
++ You should have received a copy of the GNU General Public License
++ along with Darling.  If not, see <http://www.gnu.org/licenses/>.
++*/
++
++#include "IOTrace.h"
++
++#include <stdarg.h>
++#include <stdio.h>
++#include <sys/types.h>
++#include <unistd.h>
++
++/* Defined in iokitd.cpp.  Declared here (rather than through iokitd.h) so this
++ * C translation unit does not pull in the Mach headers. */
++extern pid_t g_iokitCurrentCallerPID;
++
++#define IOTRACE_FLAG "/tmp/darling-hw-trace"
++#define IOTRACE_LOG  "/tmp/darling-hw-trace.log"
++
++static int iotrace_state = -1;
++
++int iotrace_enabled(void)
++{
++	if (iotrace_state < 0)
++		iotrace_state = (access(IOTRACE_FLAG, F_OK) == 0);
++	return iotrace_state;
++}
++
++void iotrace_line(const char* format, ...)
++{
++	FILE* file;
++	va_list args;
++
++	if (!iotrace_enabled())
++		return;
++
++	file = fopen(IOTRACE_LOG, "a");
++	if (!file)
++		return;
++
++	fprintf(file, "H1IOKIT caller=%d ", (int) g_iokitCurrentCallerPID);
++	va_start(args, format);
++	vfprintf(file, format, args);
++	va_end(args);
++	fputc('\n', file);
++
++	fclose(file);
++}
+
+diff --git a/src/IOTrace.h b/src/IOTrace.h
+new file mode 100644
+--- /dev/null
++++ b/src/IOTrace.h
+@@ -0,0 +1,37 @@
++/*
++ This file is part of Darling.
++
++ Copyright (C) 2026 Darling developers
++
++ Darling is free software: you can redistribute it and/or modify
++ it under the terms of the GNU General Public License as published by
++ the Free Software Foundation, either version 3 of the License, or
++ (at your option) any later version.
++
++ Darling is distributed in the hope that it will be useful,
++ but WITHOUT ANY WARRANTY; without even the implied warranty of
++ MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ GNU General Public License for more details.
++
++ You should have received a copy of the GNU General Public License
++ along with Darling.  If not, see <http://www.gnu.org/licenses/>.
++*/
++
++#ifndef IOKITD_IOTRACE_H
++#define IOKITD_IOTRACE_H
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/* darling-lol H1: passive IORegistry/IOKit audit trace.  Enabled solely by the
++ * presence of /tmp/darling-hw-trace, checked once per process.  The trace only
++ * reports what the registry returned; it never changes a result. */
++int iotrace_enabled(void);
++void iotrace_line(const char* format, ...);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif // IOKITD_IOTRACE_H
+
+diff --git a/src/ServiceRegistry.h b/src/ServiceRegistry.h
+--- a/src/ServiceRegistry.h
++++ b/src/ServiceRegistry.h
+@@ -33,6 +33,7 @@
+ 	void registerService(IOService* service);
+ 	IOIterator* iteratorForMatchingServices(NSDictionary* criteria) const;
+ 	IOObject* firstMatchingService(NSDictionary* criteria) const;
++	void logInventory() const;
+ private:
+ 	std::list<IOService*> m_registeredServices;
+ };
+
+diff --git a/src/ServiceRegistry.mm b/src/ServiceRegistry.mm
+--- a/src/ServiceRegistry.mm
++++ b/src/ServiceRegistry.mm
+@@ -20,19 +20,42 @@
+ #include "iokitd.h"
+ #include "ServiceRegistry.h"
+ #include <IOKit/IOCFUnserialize.h>
++#include <IOKit/IOKitKeys.h>
+ #include <CoreFoundation/CFString.h>
+ #include <IOKit/IOReturn.h>
++#import <Foundation/NSString.h>
+ #include <os/log.h>
+ #include <stdexcept>
+ #include <string>
+ #include <cstring>
+ #include <vector>
++#include <cstdio>
+ #include "IOIterator.h"
++#include "IOTrace.h"
+ 
+ extern "C" {
+ #include "iokitmigServer.h"
+ }
+ 
++// darling-lol H1: bounded, single-line rendering of a matching dictionary.
++// Single-threaded (iokitd runs on the main dispatch queue), so a static buffer
++// is enough; the trace must never call back into IOKit.
++static const char* iotrace_criteria(NSDictionary* criteria)
++{
++	static char buffer[512];
++	NSString* description = criteria ? [criteria description] : nil;
++	const char* text = description ? [description UTF8String] : "(null)";
++	size_t i;
++
++	if (!text)
++		text = "(null)";
++
++	for (i = 0; i + 1 < sizeof(buffer) && text[i]; i++)
++		buffer[i] = (text[i] == '\n' || text[i] == '\r' || text[i] == '\t') ? ' ' : text[i];
++	buffer[i] = '\0';
++	return buffer;
++}
++
+ ServiceRegistry* ServiceRegistry::instance()
+ {
+ 	static ServiceRegistry reg;
+@@ -49,6 +72,8 @@
+ 			matching.push_back(*it);
+ 	}
+ 
++	iotrace_line("op=iterator matches=%zu criteria=%s", matching.size(), iotrace_criteria(criteria));
++
+ 	return new IOIterator(matching);
+ }
+ 
+@@ -57,9 +82,27 @@
+ 	for (IOService* service : m_registeredServices)
+ 	{
+ 		if (service->matches(criteria))
++		{
++			iotrace_line("op=service_match rv=0 service=%s criteria=%s",
++				service->className(), iotrace_criteria(criteria));
+ 			return service;
+-	}
++		}
++	}
++	iotrace_line("op=service_match rv=-1 notfound criteria=%s", iotrace_criteria(criteria));
+ 	return nullptr;
++}
++
++// darling-lol H1: one snapshot of the synthetic registry, so the queries above
++// can be diffed against what this iokitd actually published.
++void ServiceRegistry::logInventory() const
++{
++	iotrace_line("op=inventory services=%zu", m_registeredServices.size());
++	for (IOService* service : m_registeredServices)
++	{
++		std::string path = service->getPath(kIOServicePlane);
++		iotrace_line("op=inventory_item class=%s path=%s match=%s",
++			service->className(), path.c_str(), iotrace_criteria(service->matchingDictionary()));
++	}
+ }
+ 
+ void ServiceRegistry::registerService(IOService* service)
+@@ -163,10 +206,18 @@
+ 	{
+ 		NSDictionary* criteria = unserializeMatching("io_service_get_matching_service_bin", matching, matchingCnt);
+ 		IOObject* match = ServiceRegistry::instance()->firstMatchingService(criteria);
+-		CFRelease(criteria);
+ 
+ 		if (!match)
++		{
++			iotrace_line("op=service_match_bin rv=0x%x notfound criteria=%s",
++				(unsigned) kIOReturnNotFound, iotrace_criteria(criteria));
++			CFRelease(criteria);
+ 			return kIOReturnNotFound;
++		}
++
++		iotrace_line("op=service_match_bin rv=0 service=%s criteria=%s",
++			match->className(), iotrace_criteria(criteria));
++		CFRelease(criteria);
+ 
+ 		*service = match->port();
+ 		return kIOReturnSuccess;
+
+diff --git a/src/main.mm b/src/main.mm
+--- a/src/main.mm
++++ b/src/main.mm
+@@ -29,6 +29,7 @@
+ #include "iokitd.h"
+ #include "iokitmig.h"
+ #include "IOObject.h"
++#include "ServiceRegistry.h"
+ #include "IODisplayConnectX11.h"
+ #include "PowerAssertions.h"
+ #include "IOSurfaceRoot.h"
+@@ -76,6 +77,8 @@
+ 
+ 	// Build IOKit registry here
+ 	discoverAllDevices();
++	// darling-lol H1: snapshot the registry once, before any client query.
++	ServiceRegistry::instance()->logInventory();
+ 	initPM();
+ 
+ 	dispatch_queue_t queue = dispatch_get_main_queue();

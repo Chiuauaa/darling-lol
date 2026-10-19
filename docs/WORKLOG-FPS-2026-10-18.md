@@ -683,3 +683,192 @@ Still deliberately not done: framebuffer caching (26 `vkCreateFramebuffer`/`vkDe
 per frame). It is a real per-pass cost, but evicting a cached framebuffer safely needs
 GPU-completion tracking (the retirement queue is not GPU-aware) and holding the
 attachments alive — too risky to land without a measurement.
+
+## Seventh session, 2026-10-19: two more per-commit allocations and one shadowed cast
+
+A code-only pass over `PrivateCommandBuffer::commit()` (no new capture; the match2
+trace is still the reference) closed the two remaining per-commit scratch allocations
+and one redundant encoder cast. All three preserve submission order and the set of
+Vulkan calls:
+
+1. **`presentationSemaphores` is `thread_local`.** It was left as a local vector when
+   the other six scratch lists were converted in the sixth session, so the worker
+   allocated one vector (and its backing store) per commit — ~26 per frame. It is
+   cleared per commit like the rest, and is captured by value into the completion
+   handler as before.
+2. **`extraWaitSemaphores` is `thread_local`** with the same per-commit clear. It is
+   also captured by value, so the handler still owns its snapshot.
+3. **The blit encoder test is an `else if`.** The per-commit walk cast every encoder
+   to `PrivateRenderCommandEncoder` and then again to `PrivateBlitCommandEncoder`; a
+   command buffer's encoders are disjoint kinds, so the second cast now only runs for
+   encoders the first one rejected — the common (render) encoder pays one cast.
+
+Validated with `python3 scripts/prepare.py --check-only` (all 30 components). No
+runtime measurement yet; the frame is still the serial `record + replay` chain, so
+these only shrink the worker's fixed per-commit cost. The working tree was not
+re-applied: the checkout already carries unrelated local edits (the same condition
+`prepare.py` reports for `iokitd`).
+
+## Eighth session, 2026-10-19: why the GTX 1070 idles (archived traces only)
+
+No game start, no flag armed, no build/install. Sources: the reference match
+`build/fps-diag/match2-metal-trace.log` (47 windows of 5 s), `build/fps-diag/thread-prof.log`
+(the **same** match, captured live by the fifth session), and the microbenchmarks
+already archived in `build/fps-diag/`.
+
+### Frame budget (47 windows)
+
+| Metric | Mean | p50 | p90 |
+|---|---|---|---|
+| FPS | 27.8 | 28.0 | 38.2 |
+| `commits/frame` | 23.9 | 22.5 | 35.5 |
+| `submitMs/frame` (worker) | **25.4 ms** | 25.1 | 36.0 |
+| `submitTasks/frame` | 57.0 | — | — |
+| `commits/s` | 670 (max 884) | — | — |
+| `drain@commit` (main) | 136 blocks/5 s, sum **2.90 s/5 s = 58 %** of the main thread's wall, 21 ms/block | — | — |
+| `vkQueueSubmit2` | **~1.0 per frame**, avg 0.0 ms | — | — |
+| `binarySemMs/frame` | 1.93 ms | — | — |
+
+The frame is `record (main) + replay (one FIFO worker) + ~1 queue submit + present`.
+The replay is ~25 ms of a ~36 ms frame; the GPU gets **one** small submission per frame
+(~0.9 `vkQueueSubmit2`/frame) and then idles for the rest of the frame while the worker
+prepares the next one. The live `nvidia-smi` numbers (second/third sessions) — 7–34 %,
+P5, idle clocks — are the mirror image of this: the GPU is not asked to do much, and it
+is not asked often enough.
+
+Worker, from `thread-prof.log` (60 s at the tail of the same match): **0.648 core
+(0.111 user / 0.538 sys)**; the wall inside submit tasks is 0.697 core, so the worker is
+essentially on-CPU, not blocked. Game process total 0.94 core (max 1.01). The replay
+translation itself (`optime@`) is 0.10–0.12 core of user — so the worker is
+**kernel-dominated**, and there are only ~57 submit tasks for ~24 commits (≈2.4 tasks
+per commit).
+
+### What the archive can and cannot attribute
+
+Per-commit suspects that *do* have a counter in `match2`:
+
+| Suspect | Measured | Share of a core |
+|---|---|---|
+| Binary semaphore create+destroy | ~1 create + 1 destroy **per frame** (254 µs + 1713 µs) | **0.054** |
+| `vkQueueSubmit2` | ~1/frame; microbench 0.57 µs SYS | ~0 |
+| `vkAllocateMemory` | `bufferAlloc<4M` ~23 per 5 s (pooled) | ~0.001 |
+
+That is ~8 % of the worker's 0.648. The remaining ~0.45 core of `sys` is **not
+attributable from the archive**: `graphicsQueueMutex` and the commit-section timers
+(`commitReserve`, `commitHandles`, `commitRegister`, `commitBatch`, `commitSubmit`) have
+no counter in this capture (no `phases@`/section lines), and the per-call microbenchmarks
+show the Vulkan calls themselves are microseconds. The gap is most consistent with
+Darling's syscall/RPC translation plus preemption on a saturated box (1100–2300
+involuntary switches/s in the same capture), but that is a hypothesis, not a measurement.
+
+### (b) `vkCreateFramebuffer` / `vkDestroyFramebuffer` — closable, and negligible
+
+The trace contains **zero** framebuffer events, so it cannot answer this. The archived
+microbench can: `vk-kernel-bench` (re-run on this host, GTX 1070 / 580.178.04) reports
+`vkCreate+DestroyFramebuffer` = **0.10 µs wall / 0.06 µs CPU / 0.00 µs SYS** per call.
+At the ~26 passes/frame quoted earlier that is **~2.6 µs/frame** — three orders of
+magnitude below the 25 ms the worker spends per frame. Framebuffer caching is therefore
+**not** a lever on this driver; it should be dropped from the frame-path backlog.
+
+### (c) Spare cores for a second replay worker — closable, and the answer is "none right now"
+
+`thread-prof.log`, same match: the game process uses **0.94 core** (worker 0.65, main
+0.265, `indium-poll`+`indium-batch` 0.03). The i3-8100 is **4 threads with no SMT**, and
+the box was measured at ~3.7/4 cores of demand in that session — the Darling-hosted
+Chromium clients alone are ~1.7 core, `darlingserver` ~0.3, desktop ~0.3. So the free
+headroom is **~0.25 core**: there is **no full core** for a second replay worker while
+the clients run. Note also that the main thread being parked 58 % of its wall does *not*
+free a core — parking is blocking, and the main thread's own CPU is only 0.265 core. To
+fit a second worker you must first reclaim the ~1.7 core the Chromium clients burn, which
+is a separate (and user-visible) bug.
+
+### (d) Minimum commits/frame, order-preserving, and what it is worth
+
+`encCreate ≈ 0.92 × commits` in the same windows, i.e. **~one render pass per command
+buffer**. The submit-batch merges *queue submits*, not *replay units*: each committed
+command buffer is still replayed on its own. So the order-preserving floor with the
+current per-commit synchronisation model is **~the render-pass count (~22/frame)**, worth
+about **1.09×** (28 → ~30 FPS). The FPS ≈ 664 commits/s ÷ commits/frame identity puts
+60 FPS out of reach until `commits/frame ≤ 11`; that needs command buffers to be merged
+into far fewer replay units (a synchronisation-model / design change), not more batching.
+
+### Consequence for the backlog
+
+This corrects the emphasis of the fifth-to-seventh sessions: shaving the worker's fixed
+per-commit cost is worth little at 24 commits and a ~670 commits/s ceiling — 2.16× is
+needed for 60 FPS. The only levers with the right order of magnitude are **parallel
+replay** and **a large reduction in replay units (commits/frame)**. Framebuffer caching
+is dead (see (b)).
+
+## Ninth session, 2026-10-19: machine occupancy and the worker's N-core ceiling (archived files only)
+
+No game start, no flag, no process touched. Sources: the same `match2` capture
+(`match2-metal-trace.log` + `thread-prof.log`, 47 windows / 235 s) plus what is already
+written down in this worklog.
+
+### 1. Machine occupancy during a match — the archive does **not** contain the decomposition
+
+The per-process probe files in `build/fps-diag/` (`game-threads*.log`, `thread-prof.*`)
+only ever sample the **game** process (`mldr` / `indium-*`), by design
+(`tools/game-thread-probe.py` matches the game's argv). A search of every archived log
+found **no** `CrRendererMain` / `CrBrowserMain` / `CrGpuMain` / `ThreadPoolForeground`
+sample and no `ps`/`top` dump: the raw second-session `ps`/`top` sample lived in
+`/tmp/opencode`, which the worklog already notes is gone.
+
+So the only archived evidence is the **second-session summary table** (see *Machine
+saturation, and the one big Darling-side CPU leak* above): Riot Client renderer
+`CrRendererMain` **69–81 %** (six `ThreadPoolForeground` threads at 7–17 % each),
+League Client browser `CrBrowserMain` **32–52 %**, two `CrGpuMain` at **25–27 %** each,
+`darlingserver` 27–47 %, desktop ~0.3 core — the Darling-hosted Chromium stack alone
+~**1.65–1.9 core**. That is a summary, not a per-thread attribution: it cannot say
+*which* PIDs map to which window, *what* each thread is doing (rasterisation vs idle
+compositing vs a busy-loop), or whether each is needed while a match runs. Those
+questions need a fresh, read-only `/proc` sample taken **during** a match — i.e. a game
+start, which is reserved. From collected files alone, item 1 is **not** closable beyond
+the summary above.
+
+Note: three archived startup logs (`riot-run.log`, `riot-run-prof.log`,
+`riotcli-launch.log`, and the `run-2026*.log` files) carried a plaintext
+`remotingAuthToken`/`riotclient-auth-token`. They were redacted by value in place
+(counts only, value never printed); no code or runtime library was touched.
+
+### 2. Worker FPS ceiling for N dedicated cores
+
+Measured worker demand, same match: `submitMs/frame` = **25.6 ms** (wall inside submit
+tasks), of which the worker's CPU is **23.7 ms/frame** (0.648 core at 27.3 FPS) split
+**sys 19.7 / user 4.1 ms**; the wall-share is 0.697 core, so ~93 % of the in-task time is
+on-CPU and the worker already runs ~0.70 of wall. Main-thread (record) demand is
+**9.7 ms/frame** (0.265 core).
+
+Two models, because the answer depends on whether record overlaps replay:
+
+| Case | replay wall/frame | FPS if record **overlaps** | FPS if record is **serialized** |
+|---|---|---|---|
+| today (shares the box, ~0.70 core) | ~25.6 ms | — | 36.7 ms → **27.3** |
+| **N=1** dedicated core | 23.7–25.6 ms | **~39–42** | **~28–30** |
+| **N=2** dedicated cores | ~11.9–12.8 ms | **~78–84** (ideal) | **~44–47** |
+
+Reading:
+
+- **N=1 buys little.** If the main thread can overlap the replay, a dedicated core lifts
+  the worker from ~0.70 to ~1.0 core, i.e. ~1.4×, to ~**39–42 FPS**; if the frame stays
+  serialized (today's `drain@commit` pattern) it is closer to flat (~28–30). Either way
+  **N=1 does not reach 60**.
+- **N=2 reaches the range only in the ideal case.** Perfectly parallel replay gives
+  ~78–84 FPS, but the replay is not perfectly parallel: `graphicsQueueMutex` and the one
+  `vkQueueSubmit2` path serialise the submit part. With a serialised fraction *f*,
+  `replay(N) = 25.6·(f + (1−f)/N)`; at *f* ≈ 0.5, N=2 gives ~36 FPS serialized / ~47
+  overlapped. This is also why **the ~19.7 ms/frame of sys matters**: if it is per-commit
+  work it parallelises, if it is the shared mutex/queue it does not. That is exactly the
+  attribution the implementer's timing capture (item 3 of his queue) has to settle before
+  betting on parallel replay.
+
+### 3. Is "reclaim non-game CPU" analyzable without touching a process?
+
+**No, not from collected files, and not fully without a running match.** The analysis
+*can* be done read-only — sampling `/proc/<pid>`/task and `schedstat` is not `nice`,
+`cgroup`, `stop` or a signal, and the project already treats it as non-intervention — but
+it needs a live match, and the raw sample was not kept. Any actual reclamation
+(`nice`/`cgroup`/suspending the clients) is intervention and is **not** mine to run: I am
+only proposing it here for the coordinator's decision. Nothing was niced, cgrouped,
+stopped or killed.

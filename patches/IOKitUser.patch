@@ -30,3 +30,121 @@ index 81ed8f7..3120abb 100644
      return( notify->wakePort );
  }
  
+
+diff --git a/kext.subproj/HWTrace.h b/kext.subproj/HWTrace.h
+new file mode 100644
+--- /dev/null
++++ b/kext.subproj/HWTrace.h
+@@ -0,0 +1,68 @@
++/*
++ This file is part of Darling.
++
++ Copyright (C) 2026 Darling developers
++
++ Darling is free software: you can redistribute it and/or modify
++ it under the terms of the GNU General Public License as published by
++ the Free Software Foundation, either version 3 of the License, or
++ (at your option) any later version.
++
++ Darling is distributed in the hope that it will be useful,
++ but WITHOUT ANY WARRANTY; without even the implied warranty of
++ MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ GNU General Public License for more details.
++
++ You should have received a copy of the GNU General Public License
++ along with Darling.  If not, see <http://www.gnu.org/licenses/>.
++*/
++
++#ifndef IOKITUSER_KEXT_HWTRACE_H
++#define IOKITUSER_KEXT_HWTRACE_H
++
++/*
++ * darling-lol H1 (client side): passive trace of the kext/kextd queries that
++ * never reach iokitd.  Same /tmp/darling-hw-trace gate as the server and the
++ * sysctl shim, checked once per process with access(); it only reports what the
++ * call returned and never changes a result.  With the flag absent the cost is
++ * the one cached access().
++ */
++
++#include <stdarg.h>
++#include <stdio.h>
++#include <unistd.h>
++
++#define DARLING_HW_TRACE_FLAG "/tmp/darling-hw-trace"
++#define DARLING_HW_TRACE_LOG  "/tmp/darling-hw-trace.log"
++
++static inline int darling_hw_trace_enabled(void)
++{
++	static int state = -1;
++
++	if (state < 0)
++		state = (access(DARLING_HW_TRACE_FLAG, 0) == 0);
++	return state;
++}
++
++static inline void darling_hw_trace(const char* format, ...)
++{
++	FILE* file;
++	va_list args;
++
++	if (!darling_hw_trace_enabled())
++		return;
++
++	file = fopen(DARLING_HW_TRACE_LOG, "a");
++	if (!file)
++		return;
++
++	fprintf(file, "H1IOKIT caller=%d ", (int) getpid());
++	va_start(args, format);
++	vfprintf(file, format, args);
++	va_end(args);
++	fputc('\n', file);
++
++	fclose(file);
++}
++
++#endif // IOKITUSER_KEXT_HWTRACE_H
+
+diff --git a/kext.subproj/KextManager.c b/kext.subproj/KextManager.c
+--- a/kext.subproj/KextManager.c
++++ b/kext.subproj/KextManager.c
+@@ -37,6 +37,7 @@
+ 
+ #include "OSKext.h"
+ #include "misc_util.h"
++#include "HWTrace.h"
+ #include "KextManager.h"
+ #include "KextManagerPriv.h"
+ #include "kextmanager_mig.h"
+@@ -414,6 +415,7 @@
+ 
+ finish:
+     SAFE_RELEASE(kextResult);
++    darling_hw_trace("op=kext_copy_loaded rv=%s", result ? "dict" : "NULL");
+     return (CFDictionaryRef)result;
+ }
+ 
+
+diff --git a/kext.subproj/OSKext.c b/kext.subproj/OSKext.c
+--- a/kext.subproj/OSKext.c
++++ b/kext.subproj/OSKext.c
+@@ -72,6 +72,7 @@
+ #include "OSKext.h"
+ #include "OSKextPrivate.h"
+ #include "printPList_new.h"
++#include "HWTrace.h"
+ #include "fat_util.h"
+ #include "macho_util.h"
+ #include "misc_util.h"
+@@ -12545,6 +12546,11 @@
+     SAFE_RELEASE(infoString);
+     SAFE_FREE(infoCString);
+ 
++    // darling-lol H1: prove the kext query reached the kextd RPC and what it gave
++    // back.  No kextd/com.apple.KernelExtensionServer exists in Darling.
++    darling_hw_trace("op=kext_request op_result=%d present=%d",
++        (int) op_result, result ? 1 : 0);
++
+     return result;
+ }
+ 
