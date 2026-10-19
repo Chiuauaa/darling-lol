@@ -6,6 +6,15 @@ window is closed (see [WORKLOG-OpenGL-EGL.md](WORKLOG-OpenGL-EGL.md) and
 this file records why the FPS on this machine is low, one crash caused during the
 investigation, and the experiments queued for the next session.
 
+> **Artifacts.** The session scratch lived in `/tmp/opencode`, which is **tmpfs
+> and wiped on reboot**. A full snapshot (overlay sources, prebuilt overlays,
+> capture scripts, logs and CSVs) is now kept at **`build/fps-diag/`** inside the
+> repo — `build/` is gitignored, so the tree stays clean. Use that path for the
+> commands below; older references to `/tmp/opencode/...` mean the same file there.
+> Files from the earliest sessions (`baseline/`, `monitor2.py`, `run4.log`,
+> `bi.py`, `QuartzCore.installed-backup`) were already gone before the snapshot
+> and are not recoverable.
+
 > **Second session, same day (20:00–21:10) — read
 > [the section below](#second-session-20002110-the-frame-is-latency-bound-not-cpu-starved)
 > first.** With internal instruments (per-frame CSVs, per-site wait counters, GPU
@@ -538,10 +547,10 @@ completion callback, so *time of release* is safe to pool from).
 
 ### Overlay extended to attribute it
 
-`/tmp/opencode/indium-src-counters` now counts `binarySemCreate` /
+`build/fps-diag/indium-src-counters` now counts `binarySemCreate` /
 `binarySemCreateExport` / `binarySemDestroy` (+ `…Micros`) and the per-frame line
 gained `binarySemC/frame`, `binarySemCE/frame`, `binarySemD/frame`,
-`binarySemMs/frame`. Rebuild with `python3 /tmp/opencode/build-counters-overlay.py`.
+`binarySemMs/frame`. Rebuild with `python3 build/fps-diag/build-counters-overlay.py`.
 
 ### Reproducing offline failed
 
@@ -553,12 +562,12 @@ a real match.
 
 ### Next-session protocol
 
-1. `sh /tmp/opencode/arm-counters.sh` (installs the counters overlay and arms the
+1. `sh build/fps-diag/arm-counters.sh` (installs the counters overlay and arms the
    flags in-guest), then launch with the usual command; also arm
    `/tmp/metal-op-timing` **before the game process starts** (third-session instrument).
 2. Read `indium-worker-per-frame@` for `binarySemC/frame`, `submitMs/frame`,
    `commits/frame`; read `optime@` for the per-op replay breakdown.
 3. If `binarySemC/frame` is small, the lever is inside `replay()` (use `optime@`); if it
    is a few per frame, pool the binary semaphores (flag-gated A/B) and re-measure.
-4. Rollback of the overlay: `sh /tmp/opencode/restore-libindium.sh` (or the saved
+4. Rollback of the overlay: `sh build/fps-diag/restore-libindium.sh` (or the saved
    `libindium.dylib.darling-lol-backup` next to it).

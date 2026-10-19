@@ -13,6 +13,12 @@ project documentation (`STATUS.md`, `SETUP.md`, `TESTING.md`,
 The follow-on FPS work on the same machine is in
 [WORKLOG-FPS-2026-10-18.md](WORKLOG-FPS-2026-10-18.md).
 
+> **Artifacts.** This session's scratch lived in `/tmp/opencode` (tmpfs, wiped on
+> reboot). A full snapshot is kept at **`build/fps-diag/`** in the repo (gitignored);
+> references below to `/tmp/opencode/...` mean the same file there. The few
+> session-only files named here (`bi.py`, `QuartzCore.installed-backup`, `run4.log`,
+> `monitor2.py`) were already gone before the snapshot.
+
 ## Status (2026-10-18, end of session)
 
 All five symptoms are resolved. The launcher itself is verified working by the
