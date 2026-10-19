@@ -80,6 +80,22 @@ libraries.
   loading screen; the same signature recurs on 10-17/10-18 across older builds,
   so it is not automatically attributable to today's hunks.
 
+### Roles (set 12:57)
+
+- **`ses_eb4404820ffeyQ0JXT2BUNIMq0` ("Debug 6") is the implementer of record.**
+  Every change to `patches/` and to a runtime overlay goes through it, or is
+  handed to it by the coordinator. Analysis sessions propose; Debug 6 writes.
+- **Coordinator** (the session that owns this section): reads all sessions,
+  arbitrates contested files, owns the game-start/freeze calendar, and relays a
+  code request to Debug 6 only when there is a decided, scoped change to make.
+- **Analysis sessions** (`ses_eab36ec62…` GPU frame path, `ses_eab329d85…`
+  telemetry, `ses_ead69602a…` reviewer/static RE) do not land runtime code
+  themselves; they hand a spec, a diff or a validated hunk to Debug 6.
+- Exception that stands until revoked: the telemetry session keeps authorship of
+  its own `patches/xnu.patch` + `patches/iokitd.patch` hunks, because they are
+  self-contained, already validated (`--check-only` 30/30) and Debug 6 has
+  reviewed them. Any further change to those two files still goes to Debug 6.
+
 ### Who holds which shared resource
 
 - **`RuntimeLibraries/libindium.dylib` + the indium overlay**: held by the author
@@ -190,9 +206,9 @@ libraries.
   - **RESULT (pre-5ª test, done):** it **loads** — black screen gone, image up.
     ⇒ **the regression lives in the 5ª/6ª hunks, it is not a pre-existing crash.**
     The forensics below explain *how* those hunks corrupt the process.
-  - **Next test (needs one game start):** install `session5-clean` (`2909b341…`,
-    the 5ª build) and play. Loads ⇒ culprit is the 6ª hunk; dies ⇒ culprit is the
-    5ª hunk.
+  - **Running (12:53):** `session5-clean` (`2909b341…`, the 5ª build) is now
+    installed and the namespace restarted; awaiting one game start. Loads ⇒ culprit
+    is the 6ª hunk; dies ⇒ culprit is the 5ª hunk.
   - **Suspected hunks:** (a) 5ª session event-loop wake coalescing in
     `indium/device.cpp` (`_pollWaiting` guard, thread_local snapshot scratch in
     `pollEvents`, `wakeupEventLoop`, `waitForSemaphore`); (b) 6ª session

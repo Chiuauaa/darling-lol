@@ -21,6 +21,7 @@ Conventions for AI agents working in this repository.
 - A message can be delivered into another session with `opencode run -s <sessionID> "<text>"`. It enqueues a normal user turn, delivered at the next turn boundary — it never cuts a running step, and it does not change the session's agent, model or variant. Observed side effects: it becomes a user turn that competes with the human's next prompt, it can trigger a context compaction on a large session, and it costs tokens.
 - Delivery discipline: send only when that session is idle, prefix the text with `[coordenação]`, state explicitly that it does not change that session's task, ask exactly one question, and never ask for a build, an install or a game start from a session you do not own. One message per session per issue.
 - Only one session owns a contested file at a time. When a bisect or a runtime capture is open, the file and the runtime library under test are frozen for everyone else.
+- One session is the **implementer of record** (declared in `docs/COORDINATION.md`, *Roles*): every change to `patches/` and to a runtime overlay is written by it, or handed to it with a scoped spec by the coordinator. Analysis sessions propose; the implementer writes.
 - Sessions working on telemetry must not arm each other's flags, and the one-knob-per-game-start rule below applies across sessions, not just within one.
 
 ## Anti-cheat (Vanguard)
