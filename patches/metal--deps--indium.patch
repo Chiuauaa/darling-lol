@@ -781,7 +781,7 @@ index 8546daa..7e4993c 100644
  		void updateBindings();
  
 diff --git a/private-include/indium/device.private.hpp b/private-include/indium/device.private.hpp
-index 58f1794..be7dbdc 100644
+index 58f1794..4cb238e 100644
 --- a/private-include/indium/device.private.hpp
 +++ b/private-include/indium/device.private.hpp
 @@ -13,6 +13,8 @@
@@ -836,7 +836,7 @@ index 58f1794..be7dbdc 100644
  		std::shared_ptr<TimelineSemaphore> getWrappedTimelineSemaphore();
  
  		BinarySemaphore getBinarySemaphore(bool exportable = false);
-@@ -111,5 +128,34 @@ namespace Indium {
+@@ -111,5 +128,39 @@ namespace Indium {
  
  		INDIUM_PROPERTY(VkPhysicalDeviceMemoryProperties, m, M,emoryProperties);
  		INDIUM_PROPERTY_READONLY(Feature, f, F,eatures);
@@ -869,6 +869,11 @@ index 58f1794..be7dbdc 100644
 +        std::vector<std::pair<VkSemaphore, uint64_t>> _availableTimelineSemaphores;
 +        std::mutex _renderPassMutex;
 +        std::unordered_map<RenderPassKey, VkRenderPass, RenderPassKey::Hash> _renderPasses;
++        // Guarded by _eventLoopMutex. True while pollEvents is blocked in vkWaitSemaphores.
++        // A waiter that arrives at any other time is picked up by the next snapshot, so it
++        // does not need to pay for vkSignalSemaphore + a poll wake. Appended last on purpose:
++        // the frameworks read the members above at fixed offsets.
++        bool _pollWaiting = false;
  	};
  };
 diff --git a/private-include/indium/dynamic-vk.hpp b/private-include/indium/dynamic-vk.hpp
@@ -1931,7 +1936,7 @@ index 23fd2d3..1a48b81 100644
 +	return _gpuAddress;
  };
 diff --git a/src/indium/command-buffer.cpp b/src/indium/command-buffer.cpp
-index 43f4a84..aaa1acb 100644
+index 43f4a84..c1448da 100644
 --- a/src/indium/command-buffer.cpp
 +++ b/src/indium/command-buffer.cpp
 @@ -1,3 +1,8 @@
@@ -1943,7 +1948,7 @@ index 43f4a84..aaa1acb 100644
  #include <indium/command-buffer.private.hpp>
  #include <indium/command-queue.private.hpp>
  #include <indium/device.private.hpp>
-@@ -8,7 +13,116 @@
+@@ -8,7 +13,117 @@
  #include <indium/compute-command-encoder.private.hpp>
  #include <indium/dynamic-vk.hpp>
  
@@ -1955,6 +1960,7 @@ index 43f4a84..aaa1acb 100644
 +#include <map>
 +#include <mutex>
 +#include <string>
++#include <unordered_set>
 +#include <unistd.h>
 +#include <indium/counters.private.hpp>
  #include <condition_variable>
@@ -2060,7 +2066,7 @@ index 43f4a84..aaa1acb 100644
  
  Indium::CommandBuffer::~CommandBuffer() {};
  
-@@ -19,18 +133,47 @@ std::shared_ptr<Indium::Device> Indium::PrivateCommandBuffer::device() {
+@@ -19,18 +134,47 @@ std::shared_ptr<Indium::Device> Indium::PrivateCommandBuffer::device() {
  	return _privateDevice;
  };
  
@@ -2110,7 +2116,7 @@ index 43f4a84..aaa1acb 100644
  		// TODO: handle this in a more C++-friendly way
  		abort();
  	}
-@@ -41,13 +184,64 @@ Indium::PrivateCommandBuffer::PrivateCommandBuffer(std::shared_ptr<PrivateComman
+@@ -41,13 +185,64 @@ Indium::PrivateCommandBuffer::PrivateCommandBuffer(std::shared_ptr<PrivateComman
  		// TODO: same
  		abort();
  	}
@@ -2177,7 +2183,7 @@ index 43f4a84..aaa1acb 100644
  	auto encoder = std::make_shared<Indium::PrivateRenderCommandEncoder>(shared_from_this(), descriptor);
  	{
  		std::scoped_lock lock(_mutex);
-@@ -56,7 +250,65 @@ std::shared_ptr<Indium::RenderCommandEncoder> Indium::PrivateCommandBuffer::rend
+@@ -56,7 +251,65 @@ std::shared_ptr<Indium::RenderCommandEncoder> Indium::PrivateCommandBuffer::rend
  	return encoder;
  };
  
@@ -2243,7 +2249,7 @@ index 43f4a84..aaa1acb 100644
  	auto encoder = std::make_shared<Indium::PrivateBlitCommandEncoder>(shared_from_this());
  	{
  		std::scoped_lock lock(_mutex);
-@@ -66,6 +318,16 @@ std::shared_ptr<Indium::BlitCommandEncoder> Indium::PrivateCommandBuffer::blitCo
+@@ -66,6 +319,16 @@ std::shared_ptr<Indium::BlitCommandEncoder> Indium::PrivateCommandBuffer::blitCo
  };
  
  std::shared_ptr<Indium::BlitCommandEncoder> Indium::PrivateCommandBuffer::blitCommandEncoder(const BlitPassDescriptor& descriptor) {
@@ -2260,7 +2266,7 @@ index 43f4a84..aaa1acb 100644
  	auto encoder = std::make_shared<Indium::PrivateBlitCommandEncoder>(shared_from_this(), descriptor);
  	{
  		std::scoped_lock lock(_mutex);
-@@ -79,6 +341,7 @@ std::shared_ptr<Indium::ComputeCommandEncoder> Indium::PrivateCommandBuffer::com
+@@ -79,6 +342,7 @@ std::shared_ptr<Indium::ComputeCommandEncoder> Indium::PrivateCommandBuffer::com
  };
  
  std::shared_ptr<Indium::ComputeCommandEncoder> Indium::PrivateCommandBuffer::computeCommandEncoder(const ComputePassDescriptor& descriptor) {
@@ -2268,10 +2274,12 @@ index 43f4a84..aaa1acb 100644
  	auto encoder = std::make_shared<Indium::PrivateComputeCommandEncoder>(shared_from_this(), descriptor);
  	{
  		std::scoped_lock lock(_mutex);
-@@ -91,10 +354,239 @@ std::shared_ptr<Indium::ComputeCommandEncoder> Indium::PrivateCommandBuffer::com
+@@ -91,44 +355,276 @@ std::shared_ptr<Indium::ComputeCommandEncoder> Indium::PrivateCommandBuffer::com
  	return computeCommandEncoder(ComputePassDescriptor { {}, dispatchType });
  };
  
+-void Indium::PrivateCommandBuffer::commit() {
+-	std::unique_lock lock(_mutex);
 +namespace {
 +// Pending merged submission. Everything is guarded by the device's graphicsQueueMutex (held by every submitter).
 +struct PendingSubmit {
@@ -2280,7 +2288,8 @@ index 43f4a84..aaa1acb 100644
 +	std::vector<VkSemaphoreSubmitInfo> signals;
 +	FrameIntervalSample* frameSample = nullptr;
 +};
-+
+ 
+-	_committed = true;
 +struct SubmitBatchState {
 +	std::vector<PendingSubmit> items;
 +	std::map<VkSemaphore, uint64_t> signaled; // timeline value signalled inside the pending batch
@@ -2290,7 +2299,18 @@ index 43f4a84..aaa1acb 100644
 +	std::chrono::steady_clock::time_point since;
 +	bool timerStarted = false;
 +};
-+
+ 
+-	for (const auto& encoder: _commandEncoders) {
+-		if (auto renderEncoder = std::dynamic_pointer_cast<PrivateRenderCommandEncoder>(encoder)) {
+-			for (const auto& texture: renderEncoder->readOnlyTextures()) {
+-				if (auto privateTexture = std::dynamic_pointer_cast<PrivateTexture>(texture)) {
+-					privateTexture->precommit(shared_from_this());
+-				}
+-			}
+-			for (const auto& texture: renderEncoder->readWriteTextures()) {
+-				if (auto privateTexture = std::dynamic_pointer_cast<PrivateTexture>(texture)) {
+-					privateTexture->precommit(shared_from_this());
+-				}
 +SubmitBatchState& submitBatchState() {
 +	static SubmitBatchState* state = new SubmitBatchState;
 +	return *state;
@@ -2403,10 +2423,10 @@ index 43f4a84..aaa1acb 100644
 +				/* darling-lol perf: 500µs batch window balances submission
 +				 * merging with latency; the old 2ms added visible input lag. */
 +				submitBatchWake().wait_for(lock, std::chrono::microseconds(500));
-+			}
+ 			}
 +			std::unique_lock<std::mutex> queueLock(device->graphicsQueueMutex());
 +			if (!state.items.empty() && std::chrono::steady_clock::now() - state.since >= std::chrono::microseconds(500)) flushSubmitBatchLocked();
-+		}
+ 		}
 +	}).detach();
 +}
 +}
@@ -2457,8 +2477,9 @@ index 43f4a84..aaa1acb 100644
 +}
 +}
 +bool Indium::bindingReuseEnabled() {return bindingReuse.load(std::memory_order_relaxed);}
-+
- void Indium::PrivateCommandBuffer::commit() {
+ 
+-		// TODO: same for other encoders
++void Indium::PrivateCommandBuffer::commit() {
 +    refreshBindingReuse();
 +	// With deferred render encoding the encoders are applied on the ordered worker, so the whole commit (it reads what the
 +	// encoders recorded, ends the Vulkan command buffer and reserves timeline values in submission order) must run there too.
@@ -2496,38 +2517,28 @@ index 43f4a84..aaa1acb 100644
 +			SubmitThread::drain("drain@commit");
 +		}
 +		return;
-+	}
+ 	}
 +	auto* frameSample = beginFrameIntervalSample(!_drawablesToPresent.empty());
 +	// with /tmp/metal-worker-lease the commit is the last recorder of this command buffer, so it leases it when nothing
 +	// did before (empty buffer); by default the constructor has leased it
 +	if (workerLeaseEnabled()) ensureRecordingStarted();
- 	std::unique_lock lock(_mutex);
++	std::unique_lock lock(_mutex);
  
- 	_committed = true;
++	_committed = true;
 +	_committedAtomic.store(true, std::memory_order_release);
- 
- 	for (const auto& encoder: _commandEncoders) {
- 		if (auto renderEncoder = std::dynamic_pointer_cast<PrivateRenderCommandEncoder>(encoder)) {
-@@ -110,16 +602,28 @@ void Indium::PrivateCommandBuffer::commit() {
- 			}
- 		}
- 
-+		if (auto blitEncoder = std::dynamic_pointer_cast<PrivateBlitCommandEncoder>(encoder)) {
-+			for (const auto& texture: blitEncoder->readWriteTextures()) {
-+				if (auto privateTexture = std::dynamic_pointer_cast<PrivateTexture>(texture)) {
-+					privateTexture->precommit(shared_from_this());
-+				}
-+			}
-+		}
 +
- 		// TODO: same for other encoders
- 	}
- 
++	// The per-texture precommit() hook is a no-op for every texture kind, so the
++	// former loop only cost a dynamic_cast and a shared_from_this() per texture per
++	// commit. Keep the hook on the textures (a future kind may need it) but stop
++	// walking every encoder for it here.
++	const bool commitTiming = indiumTimingEnabled();
++	const double endStart = commitTiming ? indiumNow() : 0;
 +	GpuTiming::endSpan(_commandBuffer);
  	if (DynamicVK::vkEndCommandBuffer(_commandBuffer) != VK_SUCCESS) {
  		// TODO
  		abort();
  	}
++	if (commitTiming) indiumTiming("commitEnd", indiumNow() - endStart);
  
 -	// to keep ourselves alive until we're done
 +	// Everything below talks to the Vulkan queue and runs on the ordered submit worker (see submit-thread.private.hpp);
@@ -2535,10 +2546,30 @@ index 43f4a84..aaa1acb 100644
 +	lock.unlock();
  	auto self = shared_from_this();
 +	auto submitTask = [this, self, frameSample]() {
++
++	const bool taskTiming = indiumTimingEnabled();
++	const double collectStart = taskTiming ? indiumNow() : 0;
  
  	// for the event loop
  	auto timelineSemaphore = _privateDevice->getWrappedTimelineSemaphore();
-@@ -138,14 +642,49 @@ void Indium::PrivateCommandBuffer::commit() {
+ 
+ 	++timelineSemaphore->count;
+ 
+-	std::vector<std::shared_ptr<Texture>> readOnlyTextures;
+-	std::vector<std::shared_ptr<Texture>> readWriteTextures;
++	// Scratch for the transient lists. The worker is one thread, and the lists are
++	// fully consumed before the task returns, so reuse the capacity instead of
++	// allocating four vectors per commit (~26 commits per frame).
++	static thread_local std::vector<std::shared_ptr<Texture>> readOnlyTextures;
++	static thread_local std::vector<std::shared_ptr<Texture>> readWriteTextures;
+ 	std::vector<std::shared_ptr<BinarySemaphore>> presentationSemaphores;
++	readOnlyTextures.clear();
++	readWriteTextures.clear();
++	presentationSemaphores.clear();
+ 
+ 	for (const auto& encoder: _commandEncoders) {
+ 		if (auto renderEncoder = std::dynamic_pointer_cast<PrivateRenderCommandEncoder>(encoder)) {
+@@ -138,18 +634,67 @@ void Indium::PrivateCommandBuffer::commit() {
  			readWriteTextures.insert(readWriteTextures.end(), readWrite.begin(), readWrite.end());
  		}
  
@@ -2558,21 +2589,30 @@ index 43f4a84..aaa1acb 100644
 +        while (auto parent = texture->parentTexture()) texture = parent;
 +        return texture;
 +    };
-+    auto canonicalize = [&](std::vector<std::shared_ptr<Texture>>& textures) {
-+        std::vector<std::shared_ptr<Texture>> unique;
++    // The old form compared every root against a growing vector (O(n^2) per commit,
++    // twice) and then did another O(n*m) pass to drop read/write overlap. Hash the
++    // roots once: a pass records a few dozen textures, so this is a small but
++    // per-commit saving on the ordered worker.
++    auto canonicalize = [&](std::vector<std::shared_ptr<Texture>>& textures, std::unordered_set<Texture*>& roots) {
++        roots.clear();
++        size_t out = 0;
 +        for (const auto& texture : textures) {
 +            auto root = rootTexture(texture);
-+            if (std::find(unique.begin(), unique.end(), root) == unique.end()) unique.push_back(root);
++            if (roots.insert(root.get()).second) textures[out++] = std::move(root);
 +        }
-+        textures = std::move(unique);
++        textures.resize(out);
 +    };
-+    canonicalize(readWriteTextures);
-+    canonicalize(readOnlyTextures);
++    std::unordered_set<Texture*> writeRoots;
++    std::unordered_set<Texture*> readRoots;
++    canonicalize(readWriteTextures, writeRoots);
++    canonicalize(readOnlyTextures, readRoots);
 +    readOnlyTextures.erase(std::remove_if(readOnlyTextures.begin(), readOnlyTextures.end(),
-+        [&](const auto& texture) { return std::find(readWriteTextures.begin(), readWriteTextures.end(), texture) != readWriteTextures.end(); }), readOnlyTextures.end());
++        [&](const auto& texture) { return writeRoots.count(texture.get()) != 0; }), readOnlyTextures.end());
++    if (taskTiming) indiumTiming("commitCollect", indiumNow() - collectStart);
 +
 +	// Reserve texture timeline values in submission order. Locking only the
 +	// Vulkan call would let a later waiter be submitted ahead of its signal.
++	const double reserveStart = taskTiming ? indiumNow() : 0;
 +	std::unique_lock<std::mutex> queueLock(_privateDevice->graphicsQueueMutex());
 +
  	for (const auto& texture: readWriteTextures) {
@@ -2589,9 +2629,29 @@ index 43f4a84..aaa1acb 100644
  		presentationSemaphores.push_back(sema);
 -		privateTexture->beginUpdatingPresentationSemaphore(sema);
  	}
+-
+-	std::vector<VkSemaphoreSubmitInfo> signalInfos;
+-	std::vector<VkSemaphoreSubmitInfo> waitInfos;
++	if (taskTiming) indiumTiming("commitReserve", indiumNow() - reserveStart);
++
++	// Transient too: the batch path copies what it keeps, and the immediate path
++	// hands the arrays to vkQueueSubmit2 before returning.
++	static thread_local std::vector<VkSemaphoreSubmitInfo> signalInfos;
++	static thread_local std::vector<VkSemaphoreSubmitInfo> waitInfos;
++	signalInfos.clear();
++	waitInfos.clear();
+ 	VkCommandBufferSubmitInfo commandBufferInfo {};
  
- 	std::vector<VkSemaphoreSubmitInfo> signalInfos;
-@@ -202,11 +741,13 @@ void Indium::PrivateCommandBuffer::commit() {
+ 	VkSemaphoreSubmitInfo signalEventLoopInfo {};
+@@ -159,6 +704,7 @@ void Indium::PrivateCommandBuffer::commit() {
+ 	signalEventLoopInfo.value = timelineSemaphore->count;
+ 	signalInfos.push_back(signalEventLoopInfo);
+ 
++	const double handlesStart = taskTiming ? indiumNow() : 0;
+ 	std::vector<std::shared_ptr<BinarySemaphore>> extraWaitSemaphores;
+ 
+ 	const auto handleTextureSemaphores = [&](const std::shared_ptr<PrivateTexture>& privateTexture) {
+@@ -202,20 +748,32 @@ void Indium::PrivateCommandBuffer::commit() {
  		auto privateTexture = std::dynamic_pointer_cast<PrivateTexture>(texture);
  		const auto& presentSema = presentationSemaphores[i];
  
@@ -2610,11 +2670,14 @@ index 43f4a84..aaa1acb 100644
  
  		handleTextureSemaphores(privateTexture);
  	}
-@@ -215,7 +756,15 @@ void Indium::PrivateCommandBuffer::commit() {
++	if (taskTiming) indiumTiming("commitHandles", indiumNow() - handlesStart);
+ 
+ 	// FIXME: apparently, sometimes, this callback will not be invoked. this is obviously bad because users might want to know when we're done,
  	//        but it also leaves the resources for this command buffer tied up, essentially becoming a memory leak.
  	//        i've observed this in the cube example, and it happens more than once (because the example display semaphore is exhausted and never signaled).
  	// UPDATE: upon further testing, it seems that this only occurs when the view is off-screen/hidden. weird.
 -	_privateDevice->waitForSemaphore(timelineSemaphore->semaphore, timelineSemaphore->count, [self, timelineSemaphore, extraWaitSemaphores, presentationSemaphores]() {
++	const double registerStart = taskTiming ? indiumNow() : 0;
 +	const double submitTime = indiumTimingEnabled() ? indiumNow() : 0;
 +	_privateDevice->waitForSemaphore(timelineSemaphore->semaphore, timelineSemaphore->count, [self, timelineSemaphore, extraWaitSemaphores, presentationSemaphores, submitTime, frameSample]() {
 +		if (frameSample) frameSample->completed.store(frameIntervalNow(), std::memory_order_release);
@@ -2627,7 +2690,7 @@ index 43f4a84..aaa1acb 100644
  		{
  			std::unique_lock lock(self->_mutex);
  			self->_completed = true;
-@@ -234,8 +783,47 @@ void Indium::PrivateCommandBuffer::commit() {
+@@ -234,7 +792,51 @@ void Indium::PrivateCommandBuffer::commit() {
  		// the handlers may have captured a reference to us (from their surrounding scope), so clear out handlers so those references go away
  		self->_scheduledHandlers.clear();
  		self->_completedHandlers.clear();
@@ -2636,7 +2699,9 @@ index 43f4a84..aaa1acb 100644
 +			indiumTiming("handlersDuration", indiumNow() - callbackStart);
 +		}
  	});
- 
++	if (taskTiming) indiumTiming("commitRegister", indiumNow() - registerStart);
++
++	const double batchStart = taskTiming ? indiumNow() : 0;
 +	statCommits.fetch_add(1, std::memory_order_relaxed);
 +	if (!_drawablesToPresent.empty()) submitStatsPresented();
 +	if (Indium::submitBatchEnabled() && _drawablesToPresent.empty()) {
@@ -2666,16 +2731,18 @@ index 43f4a84..aaa1acb 100644
 +			batch.items.push_back(std::move(item));
 +			startSubmitBatchTimer(_privateDevice);
 +			if (batch.items.size() >= 16) flushSubmitBatchLocked();
++			if (batchStart) indiumTiming("commitBatch", indiumNow() - batchStart);
 +			return;
 +		}
 +	}
 +	// not batched: everything committed earlier goes first so the submission order is preserved
 +	flushSubmitBatchLocked();
-+
++	if (batchStart) indiumTiming("commitBatch", indiumNow() - batchStart);
++	const double submitStart = taskTiming ? indiumNow() : 0;
+ 
  	commandBufferInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO;
  	commandBufferInfo.commandBuffer = _commandBuffer;
- 
-@@ -252,23 +840,41 @@ void Indium::PrivateCommandBuffer::commit() {
+@@ -252,23 +854,42 @@ void Indium::PrivateCommandBuffer::commit() {
  	//        the Device constructor tries to choose command queues that support as many operations as possible, but it's possible
  	//        that a particular device only supports certain operations on certain queues (e.g. maybe it only supports transfer operations
  	//        on an exclusive queue that doesn't support graphics or compute).
@@ -2717,12 +2784,13 @@ index 43f4a84..aaa1acb 100644
  	}
 +	if (frameSample) frameSample->presented.store(frameIntervalNow(), std::memory_order_release);
 +	DynamicVK::endDiagnosticCapture(!_drawablesToPresent.empty());
++	if (taskTiming) indiumTiming("commitSubmit", indiumNow() - submitStart);
 +	};
 +	SubmitThread::run(std::move(submitTask));
  };
  
  void Indium::PrivateCommandBuffer::presentDrawable(std::shared_ptr<Drawable> drawable) {
-@@ -307,9 +913,12 @@ void Indium::PrivateCommandBuffer::addCompletedHandler(std::function<void(std::s
+@@ -307,9 +928,12 @@ void Indium::PrivateCommandBuffer::addCompletedHandler(std::function<void(std::s
  };
  
  void Indium::PrivateCommandBuffer::waitUntilCompleted() {
@@ -2835,7 +2903,7 @@ index 5f62ad0..5957bec 100644
  	DynamicVK::vkCmdBindDescriptorSets(buf->commandBuffer(), VK_PIPELINE_BIND_POINT_COMPUTE, _pso->layout(), 0, descriptorSets.size(), descriptorSets.data(), 0, nullptr);
  };
 diff --git a/src/indium/device.cpp b/src/indium/device.cpp
-index 322e186..78b77ae 100644
+index 322e186..2fc1e81 100644
 --- a/src/indium/device.cpp
 +++ b/src/indium/device.cpp
 @@ -1,4 +1,6 @@
@@ -3076,7 +3144,7 @@ index 322e186..78b77ae 100644
 +		memcpy(candidate.deviceUUID, idProperties.deviceUUID, 16);
 +		memcpy(candidate.driverUUID, idProperties.driverUUID, 16);
 +		candidates.push_back(candidate);
-+	}
+ 	}
 +
 +	// Resolve the explicit selection against the supported list. An explicit choice
 +	// is honoured even when it names a software (CPU) device, because the user asked
@@ -3159,7 +3227,7 @@ index 322e186..78b77ae 100644
 +
 +	for (size_t index: creationOrder) {
 +		globalDeviceList.push_back(std::make_shared<PrivateDevice>(candidates[index].device));
- 	}
++	}
 +
 +	appendDeviceLog("created VkDevice for " + std::to_string(globalDeviceList.size()) + " of "
 +		+ std::to_string(candidates.size()) + " supported device(s)"
@@ -3277,8 +3345,161 @@ index 322e186..78b77ae 100644
  		funcInfo.bindings.insert(funcInfo.bindings.end(), info.bindings.begin(), info.bindings.end());
  		funcInfo.embeddedSamplers.insert(funcInfo.embeddedSamplers.end(), info.embeddedSamplers.begin(), info.embeddedSamplers.end());
  	}
-@@ -480,9 +796,18 @@ void Indium::PrivateDevice::waitForSemaphore(VkSemaphore semaphore, uint64_t tar
- 	wakeupEventLoop();
+@@ -388,13 +704,19 @@ void Indium::PrivateDevice::pollEvents(uint64_t timeoutNanoseconds) {
+ 	// some extra logic to handle the case of multiple thread polling simultaneously
+ 	std::unique_lock pollingLock(_pollingMutex);
+ 
+-	std::unique_lock lock(_eventLoopMutex);
+-
+-	const std::vector<VkSemaphore> semaphores = _eventLoopSemaphores;
+-	const std::vector<uint64_t> values = _eventLoopWaitValues;
+-	const std::vector<std::function<void()>> callbacks = _eventLoopCallbacks;
+-
+-	lock.unlock();
++	std::vector<VkSemaphore> semaphores;
++	std::vector<uint64_t> values;
++	{
++		std::unique_lock lock(_eventLoopMutex);
++		// From here until the wait returns a caller must signal us: it is adding a
++		// semaphore to a set we have already snapshotted and stopped watching. At any
++		// other time the caller's semaphore is picked up by the next snapshot, so paying
++		// for vkSignalSemaphore + a poll wake per commit (League commits ~26 per frame)
++		// is wasted work.
++		_pollWaiting = true;
++		semaphores = _eventLoopSemaphores;
++		values = _eventLoopWaitValues;
++	}
+ 
+ 	VkSemaphoreWaitInfo info {};
+ 	info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO;
+@@ -405,25 +727,22 @@ void Indium::PrivateDevice::pollEvents(uint64_t timeoutNanoseconds) {
+ 
+ 	auto result = DynamicVK::vkWaitSemaphores(_device, &info, timeoutNanoseconds);
+ 
+-	if (result == VK_TIMEOUT) {
+-		// timed out with no semaphores ready
+-		return;
+-	}
+-
+ 	std::vector<size_t> readyIndices;
+ 
+ 	// now check which semaphores are ready
+ 	// (excluding 0 because that's the special event loop wakeup semaphore)
+-	for (size_t i = 1; i < semaphores.size(); ++i) {
+-		uint64_t count;
++	if (result != VK_TIMEOUT) {
++		for (size_t i = 1; i < semaphores.size(); ++i) {
++			uint64_t count;
+ 
+-		if (DynamicVK::vkGetSemaphoreCounterValue(_device, semaphores[i], &count) != VK_SUCCESS) {
+-			// TODO
+-			abort();
+-		}
++			if (DynamicVK::vkGetSemaphoreCounterValue(_device, semaphores[i], &count) != VK_SUCCESS) {
++				// TODO
++				abort();
++			}
+ 
+-		if (count >= values[i]) {
+-			readyIndices.push_back(i);
++			if (count >= values[i]) {
++				readyIndices.push_back(i);
++			}
+ 		}
+ 	}
+ 
+@@ -431,33 +750,51 @@ void Indium::PrivateDevice::pollEvents(uint64_t timeoutNanoseconds) {
+ 	// and this method cannot be invoked concurrently by different threads,
+ 	// so we assume that the front portions of the vectors (the portions we copied
+ 	// earlier) remain the same.
++	//
++	// The callbacks are moved out of the shared vectors instead of being copied: a
++	// std::function here captures shared_ptrs, so copying the whole vector on every
++	// wake was an allocation plus an atomic round trip per pending commit.
++	std::vector<std::function<void()>> readyCallbacks;
++	readyCallbacks.reserve(readyIndices.size());
+ 
+-	lock.lock();
+-
++	std::unique_lock lock(_eventLoopMutex);
++	_pollWaiting = false;
+ 	for (auto it = readyIndices.rbegin(); it != readyIndices.rend(); ++it) {
+ 		_eventLoopSemaphores.erase(_eventLoopSemaphores.begin() + *it);
+ 		_eventLoopWaitValues.erase(_eventLoopWaitValues.begin() + *it);
++		readyCallbacks.push_back(std::move(_eventLoopCallbacks[*it]));
+ 		_eventLoopCallbacks.erase(_eventLoopCallbacks.begin() + *it);
+ 	}
+ 
+ 	lock.unlock();
+ 
+-	// now let's invoke callbacks for ready semaphores
++	if (result == VK_TIMEOUT) {
++		// timed out with no semaphores ready
++		return;
++	}
+ 
+-	for (auto it = readyIndices.begin(); it != readyIndices.end(); ++it) {
+-		const auto& callback = callbacks[*it];
++	// now let's invoke callbacks for ready semaphores (in their original ascending order)
+ 
+-		if (!callback) {
+-			continue;
++	for (auto it = readyCallbacks.rbegin(); it != readyCallbacks.rend(); ++it) {
++		if (*it) {
++			(*it)();
+ 		}
+-
+-		callback();
+ 	}
+ };
+ 
+ void Indium::PrivateDevice::wakeupEventLoop() {
+ 	std::unique_lock lock(_eventLoopMutex);
+ 
++	// One signal per blocked poll. A later waiter only needs its semaphore in the
++	// poll's next snapshot, which is taken under this same mutex.
++	if (!_pollWaiting) {
++		return;
++	}
++	_pollWaiting = false;
++
++	// The signal value trails the wait value on purpose (see the constructor): the
++	// poll's next snapshot then waits for a value the semaphore has not reached, so
++	// it blocks instead of spinning. Signal exactly the value it is waiting for now.
+ 	auto oldVal = _eventLoopWaitValues[0]++;
+ 
+ 	VkSemaphoreSignalInfo info {};
+@@ -468,21 +805,40 @@ void Indium::PrivateDevice::wakeupEventLoop() {
+ };
+ 
+ void Indium::PrivateDevice::waitForSemaphore(VkSemaphore semaphore, uint64_t targetValue, std::function<void()> callback) {
+-	{
+-		std::unique_lock lock(_eventLoopMutex);
++	std::unique_lock lock(_eventLoopMutex);
++
++	_eventLoopSemaphores.push_back(semaphore);
++	_eventLoopWaitValues.push_back(targetValue);
++	_eventLoopCallbacks.push_back(std::move(callback));
+ 
+-		_eventLoopSemaphores.push_back(semaphore);
+-		_eventLoopWaitValues.push_back(targetValue);
+-		_eventLoopCallbacks.push_back(callback);
++	// Wake the event loop only if it is still blocked on the snapshot taken before
++	// this wait was queued; otherwise the next snapshot already includes it.
++	if (!_pollWaiting) {
++		return;
+ 	}
++	_pollWaiting = false;
++
++	auto oldVal = _eventLoopWaitValues[0]++;
+ 
+-	// now wakeup the event loop so it can start waiting on this new semaphore
+-	wakeupEventLoop();
++	VkSemaphoreSignalInfo info {};
++	info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO;
++	info.semaphore = _eventLoopSemaphores[0];
++	info.value = oldVal;
++	DynamicVK::vkSignalSemaphore(_device, &info);
  };
  
 -// TODO: create a semaphore pool to avoid constantly creating and destroying semaphores
@@ -3297,7 +3518,7 @@ index 322e186..78b77ae 100644
  	VkSemaphoreTypeCreateInfo typeInfo {};
  	typeInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO;
  	typeInfo.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
-@@ -505,7 +830,14 @@ Indium::TimelineSemaphore Indium::PrivateDevice::getTimelineSemaphore() {
+@@ -505,7 +861,14 @@ Indium::TimelineSemaphore Indium::PrivateDevice::getTimelineSemaphore() {
  };
  
  void Indium::PrivateDevice::putTimelineSemaphore(const TimelineSemaphore& semaphore) {
@@ -3313,7 +3534,7 @@ index 322e186..78b77ae 100644
  };
  
  std::shared_ptr<Indium::TimelineSemaphore> Indium::PrivateDevice::getWrappedTimelineSemaphore() {
-@@ -551,3 +883,160 @@ std::shared_ptr<Indium::BinarySemaphore> Indium::PrivateDevice::getWrappedBinary
+@@ -551,3 +914,160 @@ std::shared_ptr<Indium::BinarySemaphore> Indium::PrivateDevice::getWrappedBinary
  		delete ptr;
  	});
  };
@@ -3475,7 +3696,7 @@ index 322e186..78b77ae 100644
 +	return chosen;
 +};
 diff --git a/src/indium/dynamic-vk.cpp b/src/indium/dynamic-vk.cpp
-index a4677c3..69ef23f 100644
+index a4677c3..1879055 100644
 --- a/src/indium/dynamic-vk.cpp
 +++ b/src/indium/dynamic-vk.cpp
 @@ -1,4 +1,5 @@
@@ -3502,7 +3723,7 @@ index a4677c3..69ef23f 100644
 +#ifdef DARLING
 +    const char* capture = getenv("RCLOL_RENDERDOC_CAPTURE");
 +    if (capture && capture[0] == '1') {
-+        void* bridge = _elfcalls->dlopen("@PROJECT_ROOT@/build/renderdoc/capture-bridge.so");
++        void* bridge = _elfcalls->dlopen("/home/chiuaua/darling-lol/build/renderdoc/capture-bridge.so");
 +        if (bridge) {
 +            captureBegin = reinterpret_cast<void(*)(void*)>(DLSYM(bridge, "riot_capture_begin"));
 +            captureEnd = reinterpret_cast<void(*)(int)>(DLSYM(bridge, "riot_capture_end"));
@@ -6719,6 +6940,7 @@ index 5528342..4c085e6 100644
 +};
 diff --git a/private-include/indium/counters.private.hpp b/private-include/indium/counters.private.hpp
 new file mode 100644
+index 0000000..bc9b948
 --- /dev/null
 +++ b/private-include/indium/counters.private.hpp
 @@ -0,0 +1,44 @@
@@ -6768,9 +6990,10 @@ new file mode 100644
 +};
 diff --git a/private-include/indium/deferred-render-encoder.private.hpp b/private-include/indium/deferred-render-encoder.private.hpp
 new file mode 100644
+index 0000000..4ba9182
 --- /dev/null
 +++ b/private-include/indium/deferred-render-encoder.private.hpp
-@@ -0,0 +1,471 @@
+@@ -0,0 +1,478 @@
 +#pragma once
 +
 +// Deferred render-command encoding.
@@ -6815,7 +7038,14 @@ new file mode 100644
 +			// On by default in the League game process only (fight A/B 2026-10-12: 60.4 -> 72.4 fps, p99 28.7 -> 22.9 ms
 +			// with the frame-end sync in PrivateCommandBuffer::commit). Guest flag files, re-read every 256 calls:
 +			// /tmp/metal-no-async-encode turns it off there, /tmp/metal-async-encode turns it on in any process.
-+			static const bool leagueGame = [] { const char* name = getprogname(); return name && strcmp(name, "LeagueofLegends") == 0; }();
++			static const bool leagueGame = [] {
++#if defined(__APPLE__)
++				const char* name = getprogname();
++				return name && strcmp(name, "LeagueofLegends") == 0;
++#else
++				return false; // native benchmark builds are never the game process
++#endif
++			}();
 +			if ((calls.fetch_add(1, std::memory_order_relaxed) & 255) == 0)
 +				value.store(access("/tmp/metal-async-encode", F_OK) == 0 ||
 +					(leagueGame && access("/tmp/metal-no-async-encode", F_OK) != 0), std::memory_order_relaxed);
@@ -7244,6 +7474,7 @@ new file mode 100644
 +}
 diff --git a/private-include/indium/gpu-timing.private.hpp b/private-include/indium/gpu-timing.private.hpp
 new file mode 100644
+index 0000000..ae560ab
 --- /dev/null
 +++ b/private-include/indium/gpu-timing.private.hpp
 @@ -0,0 +1,259 @@
@@ -7508,6 +7739,7 @@ new file mode 100644
 +}
 diff --git a/private-include/indium/memory-pool.private.hpp b/private-include/indium/memory-pool.private.hpp
 new file mode 100644
+index 0000000..a7d31ee
 --- /dev/null
 +++ b/private-include/indium/memory-pool.private.hpp
 @@ -0,0 +1,233 @@
@@ -7746,6 +7978,7 @@ new file mode 100644
 +}
 diff --git a/private-include/indium/outline-chain.private.hpp b/private-include/indium/outline-chain.private.hpp
 new file mode 100644
+index 0000000..5f40789
 --- /dev/null
 +++ b/private-include/indium/outline-chain.private.hpp
 @@ -0,0 +1,124 @@
@@ -7875,6 +8108,7 @@ new file mode 100644
 +}
 diff --git a/private-include/indium/render-pass-key.private.hpp b/private-include/indium/render-pass-key.private.hpp
 new file mode 100644
+index 0000000..c988f01
 --- /dev/null
 +++ b/private-include/indium/render-pass-key.private.hpp
 @@ -0,0 +1,56 @@
@@ -7936,6 +8170,7 @@ new file mode 100644
 +}
 diff --git a/private-include/indium/resource-owner-cache.private.hpp b/private-include/indium/resource-owner-cache.private.hpp
 new file mode 100644
+index 0000000..74ccc6e
 --- /dev/null
 +++ b/private-include/indium/resource-owner-cache.private.hpp
 @@ -0,0 +1,62 @@
@@ -8003,6 +8238,7 @@ new file mode 100644
 +}
 diff --git a/private-include/indium/retirement-queue.private.hpp b/private-include/indium/retirement-queue.private.hpp
 new file mode 100644
+index 0000000..353a25c
 --- /dev/null
 +++ b/private-include/indium/retirement-queue.private.hpp
 @@ -0,0 +1,63 @@
@@ -8071,6 +8307,7 @@ new file mode 100644
 +}
 diff --git a/private-include/indium/submission-batch.private.hpp b/private-include/indium/submission-batch.private.hpp
 new file mode 100644
+index 0000000..06054c4
 --- /dev/null
 +++ b/private-include/indium/submission-batch.private.hpp
 @@ -0,0 +1,54 @@
@@ -8130,6 +8367,7 @@ new file mode 100644
 +}
 diff --git a/private-include/indium/submit-batch.private.hpp b/private-include/indium/submit-batch.private.hpp
 new file mode 100644
+index 0000000..f2933c4
 --- /dev/null
 +++ b/private-include/indium/submit-batch.private.hpp
 @@ -0,0 +1,12 @@
@@ -8147,6 +8385,7 @@ new file mode 100644
 +}
 diff --git a/private-include/indium/submit-thread.private.hpp b/private-include/indium/submit-thread.private.hpp
 new file mode 100644
+index 0000000..57b6ffa
 --- /dev/null
 +++ b/private-include/indium/submit-thread.private.hpp
 @@ -0,0 +1,159 @@
@@ -8337,6 +8576,7 @@ index b000d25..98baa9b 100644
  };
 diff --git a/private-include/indium/deferred-blit-encoder.private.hpp b/private-include/indium/deferred-blit-encoder.private.hpp
 new file mode 100644
+index 0000000..1a53b38
 --- /dev/null
 +++ b/private-include/indium/deferred-blit-encoder.private.hpp
 @@ -0,0 +1,239 @@
@@ -8581,6 +8821,7 @@ new file mode 100644
 +}
 diff --git a/private-include/indium/waits.private.hpp b/private-include/indium/waits.private.hpp
 new file mode 100644
+index 0000000..4e27d4c
 --- /dev/null
 +++ b/private-include/indium/waits.private.hpp
 @@ -0,0 +1,145 @@

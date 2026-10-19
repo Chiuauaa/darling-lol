@@ -571,3 +571,75 @@ a real match.
    is a few per frame, pool the binary semaphores (flag-gated A/B) and re-measure.
 4. Rollback of the overlay: `sh build/fps-diag/restore-libindium.sh` (or the saved
    `libindium.dylib.darling-lol-backup` next to it).
+
+## Fifth session, 2026-10-19: what the match capture attributed, and what was changed
+
+A real match was captured with the counters overlay (47 five-second windows, 3m25s,
+`build/fps-diag/match2-metal-trace.log`), together with `metal-op-timing`,
+`metal-debug-timing` and `metal-debug-waits`. The game process stayed alive for the
+whole match (the earlier "crash" was the agent shell reaping the tree; the launcher
+uses `setsid` now).
+
+### Numbers
+
+| Metric | Mean | p10 | p90 |
+|---|---|---|---|
+| FPS | 29.8 | 22.8 | 38.2 |
+| `submitMs/frame` (worker) | 27.6 ms | 20.0 | 36.0 |
+| `commits/frame` | 26.3 | 18.2 | 35.5 |
+| `submitTasks/frame` | 63.0 | 45.3 | 80.2 |
+| `binarySemMs/frame` | 2.02 ms | 1.73 | 2.19 |
+| replay (`translation`) | 105 ms/s = 0.105 core | — | — |
+| worker `indium-submit` | 0.559 core (**user 0.101 / sys 0.459**) | — | — |
+| `indium-poll` | 0.017 core | — | — |
+
+Replay per-op ranking (share of translation time): DrawIdx 20.8 %, DrawPrim 19.1 %,
+encCreate 13.0 %, SetPipeline 12.5 %, FTexture 6.8 %, VBuffer 5.8 %,
+VBufferOffset 5.2 %. No op is anomalous; the replay is *not* the worker's bottleneck.
+
+### What the capture ruled out
+
+- **Binary semaphore pool.** `binarySemCreateExport` is ~1/frame, not per commit, so
+  create+destroy is ~2 ms/frame (~0.04 core) and almost all of it is a *blocked*
+  `vkDestroySemaphore` in the completion callback, not CPU. Not the 21–29 ms target.
+- **Replay translation / the per-op costs.** 0.105 core, and the worker's user time is
+  0.101 core: the replay *is* essentially all of the worker's user time.
+- **The poll thread's callbacks.** `pollCallbackMs/s` (~340) is wall time inflated by
+  preemption; `/proc` puts `indium-poll` at 0.017 core. Its `handlersDuration` is 0.
+- **`vkQueueSubmit2`.** `avg=0.0 ms`; batching reduces it to ~32 submits/s.
+- **GpuTiming.** Gated by `/tmp/metal-gpu-timing`, which was not armed.
+
+So ~82 % of the worker's CPU is **kernel time** (0.459 of 0.559 core) in the commit
+body, with ~1169 involuntary context switches/s (the box is saturated: 3.7 of 4 cores).
+The task now records the sections (`commitEnd`, `commitCollect`, `commitReserve`,
+`commitHandles`, `commitRegister`, `commitBatch`, `commitSubmit`) so the next capture
+names the syscall instead of guessing.
+
+### Changes applied (`patches/metal--deps--indium.patch`)
+
+Each removes work from the ordered worker without changing submission semantics:
+
+1. **Skip the `precommit()` walk in `commit()`.** Every `precommit()` implementation is
+   a no-op (`PrivateTexture`/`TextureView`), so the loop only did a `dynamic_cast` and a
+   `shared_from_this()` per texture per commit.
+2. **Hash-based texture canonicalisation.** Read/write roots were deduplicated with
+   `std::find` against a growing vector (O(n²)) and then filtered with another O(n·m)
+   pass; now one `unordered_set` per direction.
+3. **Per-commit scratch reuse.** `readOnlyTextures`, `readWriteTextures`, `signalInfos`
+   and `waitInfos` are `thread_local` and cleared per commit instead of allocating
+   four vectors ~26 times per frame.
+4. **Event-loop wake coalescing.** `waitForSemaphore()` no longer signals the event loop
+   when the poll thread is not blocked on the old snapshot; the next snapshot (taken
+   under the same mutex) already contains the new semaphore. This removes the redundant
+   `vkSignalSemaphore` + poll wake per commit while keeping the deliberate trailing
+   signal value that stops the poll from spinning.
+5. **No callback-vector copy per poll.** `pollEvents()` snapshots only the semaphores and
+   values, then moves the ready callbacks out while erasing them, instead of copying a
+   `std::vector<std::function<...>>` (shared_ptr captures) on every wake.
+
+Nothing is behind a new flag: these are conservative reductions of work already done,
+and the old behaviour can be restored by reverting the patch hunk. Binary-semaphore
+pooling and/or deferring the `vkDestroySemaphore` were deliberately left out: the
+release is safe only once the presentation wait has completed, and a wrong reuse hangs
+the present. The next capture should tell us whether the kernel time is
+`vkEndCommandBuffer`, `vkSignalSemaphore` or the queue lock.
