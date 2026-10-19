@@ -1,15 +1,10 @@
 #!/usr/bin/env python3
-from pathlib import Path
-import shlex
-import subprocess
-root = Path(__file__).resolve().parent.parent
-flags = {}
-for line in (root / 'build/darling-src/build/src/external/metal/CMakeFiles/Metal.dir/flags.make').read_text().splitlines():
-    if line.startswith('CXX_') and ' = ' in line:
-        key, value = line.split(' = ', 1)
-        flags[key] = shlex.split(value)
-resource_include=subprocess.check_output(['clang++','-print-resource-dir'],text=True).strip()+'/include'
-flags['CXX_INCLUDES']=[resource_include if x.startswith('/usr/lib/clang/') and x.endswith('/include') else x for x in flags['CXX_INCLUDES']]
-obj = root / 'build/riot-metal-vertex-check.o'
-subprocess.run(['clang++', *flags['CXX_DEFINES'], *flags['CXX_INCLUDES'], *flags['CXX_FLAGS'], '-O2', '-c', str(root / 'tools/riot-metal-vertex-check.mm'), '-o', str(obj)], check=True)
-subprocess.run(['clang++', '-target', 'x86_64-apple-macosx11.0', '-fuse-ld=lld', '-nostdlib', '-isysroot', '@DARLING_SDK@', str(obj), '-lSystem', '-lc++', '-lobjc', '-framework', 'Foundation', str(root / 'build/riot-Metal'), '-o', str(root / 'build/riot-metal-vertex-check')], check=True)
+import riot_build as rb
+
+flags = rb.load_flags(rb.METAL_FLAGS, "CXX")
+obj = rb.ROOT / "build/riot-metal-vertex-check.o"
+rb.compile_object("clang++", flags, "CXX",
+                  rb.ROOT / "tools/riot-metal-vertex-check.mm", obj, extra=("-O2",))
+rb.link_probe("clang++", (obj,), rb.ROOT / "build/riot-metal-vertex-check",
+              libraries=("-lSystem", "-lc++", "-lobjc"), frameworks=("Foundation",),
+              extra=(rb.ROOT / "build/riot-Metal",))
