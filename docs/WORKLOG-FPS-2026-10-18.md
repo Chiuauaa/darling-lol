@@ -495,3 +495,70 @@ byte-identical; only `libindium.dylib` changed), activated by `darling shutdown`
   `machineId`, or account data.
 - Do not touch the game process in relation to Vanguard: no memory, no injection,
   no input automation.
+
+## Fourth session, 2026-10-19 (no gameplay needed to conclude): the worker is kernel-bound
+
+A short match was captured with the **stock** build and only `metal-debug-timing` +
+`metal-debug-waits` armed (in-guest flags), reading the guest trace from the host
+(`~/.darling/private/tmp/metal-trace.log`). This session adds a per-thread view and a
+new counter to the diagnostic overlay; **no change to `patches/` and the runtime was
+restored to the stock `libindium` (md5 `89e7338998e4d4de64192fa1fe3edf63`)**.
+
+### The busiest thread burns kernel time, not memory
+
+Host `/proc/<tid>/stat` deltas during a live match:
+
+| Thread | CPU | split | faults | ctxt switches |
+|---|---|---|---|---|
+| hot worker | **0.55–0.68 core** | user 0.06 / **sys 0.53** | **~0 minor-faults/s** | invol ~1050–1380/s |
+| game main (`mldr`) | 0.20–0.27 core | user 0.17 / sys 0.04 | — | parked in `futex_wait` |
+
+A `State: R` snapshot (never parked, `wchan=0`) plus ~0 minor faults rules out the
+allocation-churn theory for this thread: it is busy in **syscalls**, being preempted
+while runnable. The naming overlay (previous session) puts this thread at
+`indium-submit` 50–60 % core — i.e. it is the **deferred-replay worker**, consistent
+with the third-session model (frame = record + replay, serialized). `drain@commit`
+remains the main thread's block (`n≈184–205`/5 s, `sum≈2.9–3.2 s`/5 s, max 24–50 ms).
+
+### What the layer counters said
+
+- `vkQueueSubmit2` avg **0.0 ms**, max 0.1 ms — the driver queue call is free (again).
+- `submitToCallback` avg 3.8–4.1 ms, max 11.8–20.8 ms; `commitCall` avg 0.7 ms,
+  max 36.8 ms; `gpuCommitToComplete` avg 11.1–13.6 ms, max ~50 ms; per-pass GPU time
+  0 ms. No `slow-cmdbuf` lines (>0.3 s commits).
+- `waitSemaphoresPerSubmit` = 1.0 (constant; uninformative, per the field note above).
+
+So the worker's kernel time is **not** `vkQueueSubmit2`. Prime suspects per commit,
+each with a measured kernel cost in the earlier microbench: `vkCreateSemaphore` /
+`vkDestroySemaphore` (exportable ≈ 108 µs) and any `vkAllocateMemory`/`vkFreeMemory`
+(≈ 142 µs / 4 KB). The code shows binary semaphores have **no pool**: every commit's
+read/write textures `vkCreateSemaphore` in `getBinarySemaphore` and
+`vkDestroySemaphore` in `putBinarySemaphore` (the release happens from the GPU
+completion callback, so *time of release* is safe to pool from).
+
+### Overlay extended to attribute it
+
+`/tmp/opencode/indium-src-counters` now counts `binarySemCreate` /
+`binarySemCreateExport` / `binarySemDestroy` (+ `…Micros`) and the per-frame line
+gained `binarySemC/frame`, `binarySemCE/frame`, `binarySemD/frame`,
+`binarySemMs/frame`. Rebuild with `python3 /tmp/opencode/build-counters-overlay.py`.
+
+### Reproducing offline failed
+
+Launching only the Riot Client does **not** reproduce the workload: its processes sit
+idle (`CrGpuMain` ~0 %; `indium-submit` exists but unused) and produce **no**
+`indium-worker@` dumps, and there is no `indium-poll` thread (the client's CEF path
+never drives `pollEvents`). The heavy replay is game-specific; the next session needs
+a real match.
+
+### Next-session protocol
+
+1. `sh /tmp/opencode/arm-counters.sh` (installs the counters overlay and arms the
+   flags in-guest), then launch with the usual command; also arm
+   `/tmp/metal-op-timing` **before the game process starts** (third-session instrument).
+2. Read `indium-worker-per-frame@` for `binarySemC/frame`, `submitMs/frame`,
+   `commits/frame`; read `optime@` for the per-op replay breakdown.
+3. If `binarySemC/frame` is small, the lever is inside `replay()` (use `optime@`); if it
+   is a few per frame, pool the binary semaphores (flag-gated A/B) and re-measure.
+4. Rollback of the overlay: `sh /tmp/opencode/restore-libindium.sh` (or the saved
+   `libindium.dylib.darling-lol-backup` next to it).
