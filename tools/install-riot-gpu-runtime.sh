@@ -1,6 +1,15 @@
 #!/bin/sh
 # Build/install the paired GPU, NV12 and display-clock runtime overrides.
 set -eu
+# Installing these overrides restarts the Darling namespace (stop-darling-runtime.py
+# below), which closes any running client. Refuse to do that silently so an
+# in-progress download is never interrupted.
+if [ "${RIOT_ALLOW_RUNNING_CLIENT:-0}" != 1 ] &&
+   pgrep -f 'Applications/(Riot Clien[t]|League of Legend[s]).app/' >/dev/null 2>&1; then
+  echo "A Riot Client or League of Legends is running; a Darling restart closes it." >&2
+  echo "Exit the game and both clients first, or set RIOT_ALLOW_RUNNING_CLIENT=1 to override." >&2
+  exit 1
+fi
 project_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 guest_home=${RIOT_GUEST_HOME:-$HOME/.darling@GUEST_HOME@}
 cd "$project_dir"

@@ -11,6 +11,10 @@ runner_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 python3 "$runner_dir/ensure-darling-runtime.py"
 python3 "$runner_dir/ensure-darling-service-accounts.py"
 python3 "$runner_dir/ensure-league-runtime-layout.py"
+# The guest shares the host network namespace, so its resolver must follow the
+# host's: a host-only stub (Cloudflare WARP, systemd-resolved) is otherwise
+# unreachable through Darling's hard-coded 8.8.8.8/8.8.4.4.
+python3 "$runner_dir/ensure-guest-dns.py"
 # Discard argument-rewriting settings from the former injected shim.
 unset RCLOL_APP_ARGS RCLOL_APP_ARGS_SLOT RCLOL_APP_ARG2 RCLOL_APP_ARG2_SLOT
 unset RCLOL_APP_ARG3 RCLOL_APP_ARG3_SLOT RCLOL_UX_ARG1 RCLOL_UX_ARG1_SLOT
@@ -75,7 +79,10 @@ if [ -n "${RCLOL_REFRESH_HZ-}" ]; then export RCLOL_REFRESH_HZ; fi
 export MESA_NO_ERROR="${MESA_NO_ERROR:-1}"
 # NVIDIA proprietary driver: limit pre-rendered frames.
 export __GL_MaxFramesAllowed="${__GL_MaxFramesAllowed:-1}"
-export __GL_THREADED_OPTIMIZATIONS="${__GL_THREADED_OPTIMIZATIONS:-1}"
+# NVIDIA threaded optimizations run GL work on a worker thread that invalidates the
+# EGL display Chromium/ANGLE also uses in-process, aborting the client with
+# EGL_BAD_DISPLAY once a handful of contexts exist (the splash frame hits it).
+export __GL_THREADED_OPTIMIZATIONS="${__GL_THREADED_OPTIMIZATIONS:-0}"
 export __GL_YIELD="${__GL_YIELD:-NOTHING}"
 # Reduce timer slack for tighter scheduling in the game process tree.
 if [ -w /proc/self/timerslack_ns ]; then

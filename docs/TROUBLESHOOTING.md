@@ -31,6 +31,8 @@ sh scripts/run.sh
 
 Do not run these commands during a match. Use the independent reclamation probe in [testing](TESTING.md) to verify the new guest behavior after activation. An installer result with `installed: true` and `restart_performed: false` confirms the disk update, not activation.
 
+Framework overlays behave the same way. After replacing `RuntimeFrameworks/OpenGL.framework/Versions/A/OpenGL` from the host while a namespace was running, every process in that namespace — including freshly launched ones — kept loading the previous binary (the guest still reported its pre-update size and mtime) until `darling shutdown`. Activating the overlay therefore required a restart that closed a client mid-download and left the Riot patcher in `NeedsRepair`, which re-verifies and re-fetches the incomplete chunks. Install overlays before starting the game. The overlay installers now refuse to run while a Riot Client or League of Legends process is present, unless `RIOT_ALLOW_RUNNING_CLIENT=1` is set.
+
 ## Around 5 GB of RAM with just the clients open
 
 The observed proportional resident footprint was roughly 4.3 GiB across Riot, League and Darling, including 50 crash-handler processes. Roughly 3 GiB came from private anonymous mappings/native heaps; graphics mappings accounted for about 238 MiB. Large virtual address reservations are not equivalent to resident RAM, and summed RSS double-counts shared pages. Use proportional set size (PSS), swap and host memory pressure to assess the actual footprint.
@@ -121,7 +123,7 @@ The practice-tool exit in the same report remains unresolved: the supplied Leagu
 
 The legacy CarbonCore `Gestalt` implementation read a Darwin kernel release as though it were a macOS product version, then fell through into `gestaltSysArchitecture`, overwriting every result with `gestaltIntel` (10). The standalone probe reproduced `gestalt=10.10.10` even though `kern.osproductversion` was already `14.7`. Version selectors now read that existing product version, return before the architecture case, initialize missing patch versions to zero and implement the documented packed-BCD limits. Null outputs and unknown selectors return errors.
 
-After installing this correction and restarting locally, the client reported macOS 14.7 and the user confirmed that Play became available. Later launches failed again, including a launch without `DARLING_UI_GEOMETRY_TRACE`. The running client was verified to have the corrected CarbonCore binary loaded. Both successful and failed sessions reported macOS 14.7; successful sessions logged `MvgState: 0`, while failed sessions logged `MvgState: 5`, despite `MvgInit` and `MvgRegisterLogin` returning zero in both. These state values are observations, not a diagnosis of their undocumented meaning. The version correction is therefore insufficient to resolve VAN -101, and tracing is not required to reproduce the failure. Entering a match remains unverified. [Riot describes VAN -101](https://support.riotgames.com/en-us/riot/performance/error-van--101) as an unsupported system configuration and recommends a supported operating system or a support ticket with logs. No verified Darling compatibility fix for this failure is available in this snapshot. A temporary test rollback of commit `ac4a832` restores `proc_listpids` returning `ENOTSUP`; it was followed by both a successful launch and another VAN failure, so it has not established that commit as the cause. Tracing was enabled on the latter launch; its contribution remains unproven.
+After installing this correction and restarting locally, the client reported macOS 14.7 and the user confirmed that Play became available. Later launches failed again, including a launch without `DARLING_UI_GEOMETRY_TRACE`. The running client was verified to have the corrected CarbonCore binary loaded. Both successful and failed sessions reported macOS 14.7; successful sessions logged `MvgState: 0`, while failed sessions logged `MvgState: 5`, despite `MvgInit` and `MvgRegisterLogin` returning zero in both. These state values are observations, not a diagnosis of their undocumented meaning. The version correction is therefore insufficient to resolve VAN -101, and tracing is not required to reproduce the failure. Entering a match is now **verified**: on 2026-10-18 a practice-tool match played with the client reporting macOS 14.7 and `MvgState: 0`. [Riot describes VAN -101](https://support.riotgames.com/en-us/riot/performance/error-van--101) as an unsupported system configuration and recommends a supported operating system or a support ticket with logs. No verified Darling compatibility fix for this failure is available in this snapshot; in particular, do **not** spoof Vanguard. See [VANGUARD.md](VANGUARD.md) for what the client-side check actually does and why every probe fails here. A temporary test rollback of commit `ac4a832` restores `proc_listpids` returning `ENOTSUP`; it was followed by both a successful launch and another VAN failure, so it has not established that commit as the cause. Tracing was enabled on the latter launch; its contribution remains unproven.
 
 Build the small update with `python3 build/runtime/tools/build-riot-carboncore-runtime.py`. After manually exiting the game and both clients:
 
@@ -299,6 +301,110 @@ The X11 Chromium presenter searches shared Core Animation frame slots by surface
 `tools/riot-remote-frame-ownership-check.m` exercises the cached-frame path without creating a display or window. `tools/build-riot-x11-runtime.py` builds this probe. For an unidentified overlay, `python3 tools/trace-riot-windows.py --output build/riot-window-trace.jsonl` passively records Riot/League windows, including unmanaged windows and child stacking, for one hour. It requires the host `python-xlib` package and does not send input.
 
 If a black fullscreen game has only its normal Metal child and becomes visible after removing and restoring fullscreen, inspect the initial fullscreen transition. Automatic fullscreen now requires the window to cover an active monitor, so temporary 1x1 startup windows and ordinary windowed sizes are not promoted. Explicit Cocoa fullscreen requests are preserved. `riot-fullscreen-geometry-check` (built by the X11 builder) checks the policy against active XRandR monitor geometry using only read requests; the next game launch is still required to validate the startup sequence.
+
+### Black Metal game window or hung client: subwindow not flushed before EGL
+
+If the League client hangs on its loading screen or a practice game stays black
+while the process is alive, check whether the layer compositor ever got a
+drawable:
+
+- The game log (`.../Contents/LoL/Logs/GameLogs/<run>/*_r3dlog.txt`) repeats
+  `Metal Device timed out`.
+- With the guest flag file `/tmp/metal-debug-trace` present when the process
+  starts, the shared trace `/tmp/metal-trace.log` shows many
+  `nextDrawable-timeout` lines and no live presentations.
+
+Cause: `X11SubWindow` created and mapped the window but left the requests in its
+X connection's output buffer. `eglCreateWindowSurface` looks the window up on
+`OpenGL.framework`'s own X connection, could not find it, and returned
+`EGL_BAD_CONFIG`, so `CALayerContext` kept `_cglWindow == NULL`, `render` became
+a no-op and queued Metal drawables were never recycled. `X11SubWindow` now
+`XSync`s after creating and mapping the window, so it exists before any other
+connection inspects it.
+
+The standalone reproduction is `build/riot-metal-presentation-check`
+(`tools/riot-metal-presentation-check.mm`), which needs no running client: it
+must print `PASS: root layer, late context attachment and 10 Metal drawable
+presentations`. Run it inside the namespace with the overlays on
+`DYLD_FRAMEWORK_PATH` as in `docs/TESTING.md`.
+
+#### NVIDIA: the window attaches and the frame is dropped (fixed, 2026-10-18)
+
+The `XSync` correction stopped the starvation (`Metal Device timed out` fell from
+43 to 2 in the observed run) but a practice game still showed a **black window**
+on the NVIDIA driver while the process was alive and the presentation trace
+showed live draws. The remaining defect was reproduced without a game or a
+client, with a standalone AppKit window that owns a `CAMetalLayer`, and is fixed
+in `CGLContextMakeCurrentAndAttachToWindow`.
+
+**Root cause.** A layer context is first made current without a surface
+(`CGLSetCurrentContext` with `EGL_NO_SURFACE`). When that same context is later
+attached to a window surface, NVIDIA's EGL leaves the default framebuffer at
+`GL_DRAW_BUFFER = GL_DRAW_BUFFER0 = GL_READ_BUFFER = GL_NONE`. The attach itself
+succeeds: `CGLGetWindow` returns a surface, `glGetError()` stays clean,
+`GL_DRAW_FRAMEBUFFER_BINDING` is the default framebuffer and
+`GL_RED/GREEN/BLUE_BITS` report 8/8/8. Every draw **and every `glClear`** is then
+discarded in silence, which is why the drawable import looked healthy (the layer
+`_tex` texture provably held the frame) while the window stayed black, and why
+the timeout count dropped to zero: the compositor no longer starved, it drew into
+nothing.
+
+**Fix.** `src/frameworks/OpenGL/OpenGL.c`:
+`CGLContextMakeCurrentAndAttachToWindow` queries `GL_DRAW_BUFFER` after a
+successful attach and, only when the driver reports `GL_NONE`, selects `GL_BACK`
+(or `GL_FRONT` when the surface is single-buffered) for both the draw and the
+read buffer. Drivers that already report a buffer are not touched, so RADV/AMD
+behaviour is unchanged.
+
+**Evidence.** With `build/riot-metal-presentation-check` and no game running, a
+pixel readback of the window's back buffer inside `CARenderer` reported
+`0,0,0,255` while the compositor drew; forcing `glDrawBuffer(GL_BACK)` made the
+same readback report `255,0,0,255`, and a `spectacle` capture showed the window
+visibly red. In the same context a flat-colour client-array draw and an
+immediate-mode draw both landed (`px=255,0,0,255`) where the textured quad read
+black: geometry, rasterisation and presentation were never broken, and the
+earlier "the composite quad does not rasterise" observation was an artefact of a
+diagnostic that sampled the root layer's empty texture instead of the Metal
+layer's. After the fix, a practice match on the GTX 1070 (driver 580.178.04)
+renders Summoner's Rift at 59 FPS / 9 ms with `GAMESTATE_GAMELOOP` and zero
+`Metal Device timed out` entries; the launcher and the match window both work.
+
+`wmctrl -i -a <game window>` raises the window for a
+`spectacle -b -n -f -o <png>` full-screen capture, which is the reliable way to
+see what the compositor actually put on screen (per-window captures of GL
+windows often return black). Do **not** lower a fullscreen game window with
+`wmctrl ... -b add,below`: the resulting `_NET_WM_STATE_BELOW` conflicts with
+activation, so the window switcher can no longer bring it back.
+
+#### NVIDIA: `/tmp/metal-no-drawable-vram` aborts the game (2026-10-18)
+
+On the GTX 1070 (driver 580.178.04) the guest file `/tmp/metal-no-drawable-vram`
+makes **every** game start die with `abort()` (SIGABRT) while Metal creates its
+resources. It is a crash-loop, not a one-off: five starts in a row died ~2 s
+after the process appeared, no game window ever showed, and the Riot Client kept
+relaunching the game. It was armed experimentally on 2026-10-18 and is the only
+difference from the healthy run earlier that day (same game build
+`16.20.824.8524`), so it was the cause.
+
+How it looks:
+
+- `*_r3dlog.txt` stops at the last `Metal Device Approx VRAM: …` line, before
+  `Using X3D Platform: Metal` and `r3dRenderLayer::RecreateOwnedResources`.
+- `~/.darling/private/var/log/dserver.log` shows `LOLSIG processSignal bsd=6
+  linux=6 code=-6` (signal 6 = SIGABRT, `code=-6` = `SI_TKILL` from `abort()`),
+  one line per attempt, for the `.../Game/LeagueofLegends.app/Contents/MacOS/LeagueofLegends`
+  process.
+- The Riot Client writes a crash report: `Logs/GameCrashes/<guid>.run/__sentry-event`
+  (`level=fatal`, `platform=native`, `game.id=…`) plus `session.json`.
+- `~/.darling/private/tmp/metal-device.log` records the decision per process:
+  the healthy run earlier that day printed `pid=1274 drawable-vram=on` and
+  `storage=vram`, while every crashing attempt printed
+  `pid=… drawable-vram=off (file:/tmp/metal-no-drawable-vram)`.
+
+Fix: remove the guest file — `darling shell rm -f /tmp/metal-no-drawable-vram`
+(or delete `~/.darling/private/tmp/metal-no-drawable-vram` while Darling is shut
+down) — and start the game again. The flag is a known FPS experiment on RADV
+only; NVIDIA must not use it. See [setup](SETUP.md#metal-and-indium-overlays).
 
 ### Visible cursor while relative on Xwayland (PR #18)
 

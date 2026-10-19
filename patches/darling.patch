@@ -6257,7 +6257,7 @@ index deca16b87..d75d5e22d 100644
  
  set_property(TARGET OpenGL APPEND_STRING PROPERTY LINK_FLAGS
 diff --git a/src/frameworks/OpenGL/OpenGL.c b/src/frameworks/OpenGL/OpenGL.c
-index ffd7fe054..1ff212d34 100644
+index ffd7fe054..51af4f528 100644
 --- a/src/frameworks/OpenGL/OpenGL.c
 +++ b/src/frameworks/OpenGL/OpenGL.c
 @@ -2,11 +2,22 @@
@@ -6284,7 +6284,7 @@ index ffd7fe054..1ff212d34 100644
  
  // Try to get the right (generic) type definitions.
  // In particular, we really want EGLNativeDisplayType to be void *,
-@@ -22,8 +33,73 @@
+@@ -22,10 +33,117 @@
  #define APPLE
  #define __APPLE__
  
@@ -6313,6 +6313,7 @@ index ffd7fe054..1ff212d34 100644
 +static EGLBoolean (*p_eglDestroyContext)(EGLDisplay, EGLContext);
 +static EGLBoolean (*p_eglSwapBuffers)(EGLDisplay, EGLSurface);
 +static EGLBoolean (*p_eglSwapInterval)(EGLDisplay, EGLint);
++static EGLint (*p_eglGetError)(void);
 +
 +static int native_egl_loaded;
 +static pthread_mutex_t native_egl_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -6338,10 +6339,49 @@ index ffd7fe054..1ff212d34 100644
 +            p_eglDestroyContext = (EGLBoolean (*)(EGLDisplay, EGLContext)) dlsym(h, "eglDestroyContext");
 +            p_eglSwapBuffers = (EGLBoolean (*)(EGLDisplay, EGLSurface)) dlsym(h, "eglSwapBuffers");
 +            p_eglSwapInterval = (EGLBoolean (*)(EGLDisplay, EGLint)) dlsym(h, "eglSwapInterval");
++            p_eglGetError = (EGLint (*)(void)) dlsym(h, "eglGetError");
 +            native_egl_loaded = 1;
 +        }
 +    }
 +    pthread_mutex_unlock(&native_egl_mutex);
++}
++
++/* CGL owns a private Xlib connection for the lifetime of
++ * the process. CGLRegisterNativeDisplay() is fed AppKit's X11Display native
++ * display, but an X11Display is transient: when it is deallocated its
++ * XCloseDisplay() tears down that X connection, which silently invalidates the
++ * EGL display built on it and makes every later eglInitialize/eglCreateContext
++ * fail with EGL_BAD_DISPLAY. Owning our own connection keeps a valid EGL
++ * display even after AppKit's connection goes away. libX11 is loaded exactly
++ * like the native EGL, through the guest's /usr/lib/native shim. */
++static int own_x11_loaded;
++static void *(*p_XOpenDisplay)(const char *);
++static int (*p_XInitThreads)(void);
++static int (*p_XSync)(void *, int);
++static void *own_xdisplay;
++static pthread_mutex_t own_x11_mutex = PTHREAD_MUTEX_INITIALIZER;
++
++static void ensure_own_xdisplay(void) {
++    if (own_xdisplay)
++        return;
++    pthread_mutex_lock(&own_x11_mutex);
++    if (!own_xdisplay) {
++        if (!own_x11_loaded) {
++            own_x11_loaded = 1;
++            void *h = dlopen("/usr/lib/native/libX11.dylib", RTLD_NOW | RTLD_LOCAL);
++            if (h) {
++                p_XOpenDisplay = (void *(*)(const char *)) dlsym(h, "XOpenDisplay");
++                p_XInitThreads = (int (*)(void)) dlsym(h, "XInitThreads");
++                p_XSync = (int (*)(void *, int)) dlsym(h, "XSync");
++            }
++        }
++        if (p_XOpenDisplay) {
++            if (p_XInitThreads)
++                p_XInitThreads();
++            own_xdisplay = p_XOpenDisplay(NULL);
++        }
++    }
++    pthread_mutex_unlock(&own_x11_mutex);
 +}
 +
  static EGLDisplay display;
@@ -6357,8 +6397,12 @@ index ffd7fe054..1ff212d34 100644
 +
  static EGLConfig config;
  static int num_config;
++/* Guards the display/config globals while they are rebuilt after EGL_BAD_DISPLAY. */
++static pthread_mutex_t display_rebuild_mutex = PTHREAD_MUTEX_INITIALIZER;
  
-@@ -48,10 +124,18 @@ struct _CGLContextObj {
+ static EGLint const attribute_list[] = {
+     EGL_RED_SIZE, 1,
+@@ -48,10 +166,18 @@ struct _CGLContextObj {
      GLuint retain_count;
      pthread_mutex_t lock;
      EGLContext egl_context;
@@ -6377,7 +6421,7 @@ index ffd7fe054..1ff212d34 100644
  };
  
  struct _CGLPixelFormatObj {
-@@ -59,6 +143,24 @@ struct _CGLPixelFormatObj {
+@@ -59,6 +185,24 @@ struct _CGLPixelFormatObj {
      CGLPixelFormatAttribute *attributes;
  };
  
@@ -6402,7 +6446,7 @@ index ffd7fe054..1ff212d34 100644
  static inline int attribute_has_argument(CGLPixelFormatAttribute attr) {
      switch (attr) {
      case kCGLPFAAuxBuffers:
-@@ -69,6 +171,9 @@ static inline int attribute_has_argument(CGLPixelFormatAttribute attr) {
+@@ -69,6 +213,9 @@ static inline int attribute_has_argument(CGLPixelFormatAttribute attr) {
      case kCGLPFAAccumSize:
      case kCGLPFARendererID:
      case kCGLPFADisplayMask:
@@ -6412,7 +6456,7 @@ index ffd7fe054..1ff212d34 100644
          return 1;
      default:
          return 0;
-@@ -78,6 +183,7 @@ static inline int attribute_has_argument(CGLPixelFormatAttribute attr) {
+@@ -78,6 +225,7 @@ static inline int attribute_has_argument(CGLPixelFormatAttribute attr) {
  __attribute__((constructor))
  static void _CGLInitialize(void)
  {
@@ -6420,20 +6464,37 @@ index ffd7fe054..1ff212d34 100644
      g_displays = CFDictionaryCreateMutable(NULL, 0, NULL, NULL);
  }
  
-@@ -93,41 +199,71 @@ static int attributes_count(const CGLPixelFormatAttribute *attrs) {
+@@ -92,42 +240,86 @@ static int attributes_count(const CGLPixelFormatAttribute *attrs) {
+ }
  
  CGLError CGLRegisterNativeDisplay(void *native_display) {
- 
+-
 -    display = eglGetDisplay(native_display);
+-
+-    if (display == EGL_NO_DISPLAY) {
++    /* The only caller is AppKit's X11Display, which
++     * NSDisplay.currentDisplay hands out as a *per-thread* shared instance
++     * (NSThreadSharedInstance(@"NSDisplay")). Each such instance opens its own
++     * X connection and registers it here, then closes it via XCloseDisplay when
++     * the instance is released. Binding the process-global EGL display to that
++     * transient connection means that, as soon as the thread's X11Display goes
++     * away, the global EGL display dangles and every later eglInitialize /
++     * eglCreateContext fails with EGL_BAD_DISPLAY. Bind to CGL's own X
++     * connection instead (stable for the process lifetime) and only fall back
++     * to the caller's display if our connection could not be opened. Window
++     * surfaces still work: X drawables are server-global, so the surface can be
++     * created on our connection for a window created by AppKit. */
 +    ensure_native_egl();
-+    display = x11EGLDisplay(native_display);
- 
-     if (display == EGL_NO_DISPLAY) {
++    ensure_own_xdisplay();
++    EGLDisplay newDisplay = x11EGLDisplay(own_xdisplay ? own_xdisplay : native_display);
++
++    if (newDisplay == EGL_NO_DISPLAY) {
          return kCGLBadConnection;
      }
  
 -    eglInitialize(display, NULL, NULL);
 -    eglChooseConfig(display, attribute_list, &config, 1, &num_config);
++    display = newDisplay;
 +    p_eglInitialize(display, NULL, NULL);
 +    p_eglChooseConfig(display, attribute_list, &config, 1, &num_config);
  
@@ -6452,19 +6513,17 @@ index ffd7fe054..1ff212d34 100644
 +    if (display != EGL_NO_DISPLAY && display != NULL && config != NULL)
 +        return;
 +
++    ensure_own_xdisplay();
 +    void *nativeDisplay=_CGSNativeDisplay(CGSMainConnectionID());
-+    EGLDisplay disp = x11EGLDisplay(nativeDisplay?nativeDisplay:EGL_DEFAULT_DISPLAY);
++    EGLDisplay disp = x11EGLDisplay(nativeDisplay?nativeDisplay:(own_xdisplay?own_xdisplay:EGL_DEFAULT_DISPLAY));
 +    if (disp == EGL_NO_DISPLAY) {
-+        fprintf(stderr, "M58DG ensureDefaultDisplay: eglGetDisplay(DEFAULT)=NO_DISPLAY (p_eglGetDisplay=%p)\n", (void*) p_eglGetDisplay);
 +        return;
 +    }
 +
 +    EGLConfig cfg = NULL;
-+    EGLBoolean m58dg_ini = p_eglInitialize(disp, NULL, NULL);
-+    EGLBoolean m58dg_ch = p_eglChooseConfig(disp, attribute_list, &cfg, 1, &num_config);
-+    fprintf(stderr, "M58DG ensureDefaultDisplay: disp=%p eglInitialize=%d eglChooseConfig=%d cfg=%p num_config=%d\n",
-+        (void*) disp, (int) m58dg_ini, (int) m58dg_ch, (void*) cfg, num_config);
-+    if (m58dg_ini && m58dg_ch && cfg != NULL) {
++    EGLBoolean initialized = p_eglInitialize(disp, NULL, NULL);
++    EGLBoolean chosen = p_eglChooseConfig(disp, attribute_list, &cfg, 1, &num_config);
++    if (initialized && chosen && cfg != NULL) {
 +        display = disp;
 +        config = cfg;
 +        p_eglBindAPI(EGL_OPENGL_API);
@@ -6483,7 +6542,10 @@ index ffd7fe054..1ff212d34 100644
      if (!rv)
      {
 -        EGLDisplay disp = eglGetDisplay(_CGSNativeDisplay(cid));
-+        EGLDisplay disp = x11EGLDisplay(_CGSNativeDisplay(cid));
++        ensure_own_xdisplay();
++        void *nativeDisplay = _CGSNativeDisplay(cid);
++        EGLDisplay disp = x11EGLDisplay(nativeDisplay ? nativeDisplay
++            : (own_xdisplay ? own_xdisplay : EGL_DEFAULT_DISPLAY));
          if (disp == EGL_NO_DISPLAY)
              return NULL;
  
@@ -6500,7 +6562,7 @@ index ffd7fe054..1ff212d34 100644
  
          pthread_mutex_lock(&g_displaysMutex);
          CFDictionaryAddValue(g_displays, (const void*)(unsigned long) cid, rv);
-@@ -139,6 +275,8 @@ static struct _CGLDisplay* getCGLDisplay(CGSConnectionID cid)
+@@ -139,6 +331,8 @@ static struct _CGLDisplay* getCGLDisplay(CGSConnectionID cid)
  
  CGLError CGLSetSurface(CGLContextObj gl, CGSConnectionID cid, CGSWindowID wid, CGSSurfaceID sid)
  {
@@ -6509,7 +6571,7 @@ index ffd7fe054..1ff212d34 100644
      struct _CGLDisplay* disp = getCGLDisplay(cid);
      if (!disp)
          return kCGLBadConnection;
-@@ -152,7 +290,7 @@ CGLError CGLSetSurface(CGLContextObj gl, CGSConnectionID cid, CGSWindowID wid, C
+@@ -152,16 +346,76 @@ CGLError CGLSetSurface(CGLContextObj gl, CGSConnectionID cid, CGSWindowID wid, C
      if (!window)
          return kCGLBadWindow;
  
@@ -6518,16 +6580,77 @@ index ffd7fe054..1ff212d34 100644
      if (gl->egl_surface == EGL_NO_SURFACE)
          return kCGLBadState;
      return kCGLNoError;
-@@ -161,7 +299,7 @@ CGLError CGLSetSurface(CGLContextObj gl, CGSConnectionID cid, CGSWindowID wid, C
+ }
+ 
++/* darling-lol: report the X visual the window-capable EGL configs use so AppKit
++ * can create its windows with it. eglCreateWindowSurface only accepts a window
++ * whose visual is the config's EGL_NATIVE_VISUAL_ID; on NVIDIA/XWayland GLX's
++ * visual set (0x21c..0x368) and EGL's (0x23, 0x66) are disjoint, so every
++ * CGLGetWindow for a glXChooseVisual window returned NULL (EGL_BAD_CONFIG) and
++ * no GL or Metal content (the League game window) could ever be presented. */
++CGL_EXPORT CGLError CGLGetWindowVisual(unsigned int *visual) {
++    if (visual == NULL)
++        return kCGLBadAddress;
++
++    ensure_native_egl();
++    ensureDefaultDisplay();
++    if (display == EGL_NO_DISPLAY || display == NULL || !p_eglGetConfigAttrib)
++        return kCGLBadConnection;
++
++    /* Prefer the config the framework already created its contexts with: the
++     * window surface must be config-compatible with them. */
++    EGLint nativeVisual = -1;
++    if (config != NULL &&
++        p_eglGetConfigAttrib(display, config, EGL_NATIVE_VISUAL_ID, &nativeVisual) && nativeVisual >= 0) {
++        EGLint surfaceType = 0;
++        p_eglGetConfigAttrib(display, config, EGL_SURFACE_TYPE, &surfaceType);
++        if (surfaceType & EGL_WINDOW_BIT) {
++            *visual = (unsigned int) nativeVisual;
++            return kCGLNoError;
++        }
++    }
++
++    EGLint attrs[] = { EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
++        0x3040 /* EGL_RENDERABLE_TYPE */, 0x0008 /* EGL_OPENGL_BIT */, EGL_NONE };
++    EGLConfig candidates[64];
++    EGLint count = 0;
++    if (!p_eglChooseConfig || !p_eglChooseConfig(display, attrs, candidates, 64, &count) || count < 1)
++        return kCGLBadMatch;
++    if (!p_eglGetConfigAttrib(display, candidates[0], EGL_NATIVE_VISUAL_ID, &nativeVisual) || nativeVisual < 0)
++        return kCGLBadMatch;
++
++    *visual = (unsigned int) nativeVisual;
++    return kCGLNoError;
++}
++
  CGLWindowRef CGLGetWindow(void *native_window) {
  
      EGLNativeWindowType window = (EGLNativeWindowType) native_window;
 -    EGLSurface surface = eglCreateWindowSurface(display, config, window, NULL);
 +    EGLSurface surface = p_eglCreateWindowSurface(display, config, window, NULL);
++    if (surface == EGL_NO_SURFACE) {
++        /* The default config may not match the X window's visual, so
++         * eglCreateWindowSurface rejects it with EGL_BAD_CONFIG. Enumerate the
++         * window-capable configs and keep the first one the driver accepts. */
++        EGLint attrs[] = { EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
++            0x3040 /* EGL_RENDERABLE_TYPE */, 0x0008 /* EGL_OPENGL_BIT */, EGL_NONE };
++        EGLConfig *candidates = NULL;
++        EGLint count = 0;
++        if (p_eglChooseConfig && p_eglChooseConfig(display, attrs, NULL, 0, &count) && count > 0 && count <= 65536)
++            candidates = calloc(count, sizeof(*candidates));
++        if (candidates && p_eglChooseConfig && p_eglChooseConfig(display, attrs, candidates, count, &count)) {
++            for (EGLint n = 0; n < count && surface == EGL_NO_SURFACE; ++n) {
++                if (p_eglGetError)
++                    p_eglGetError();
++                surface = p_eglCreateWindowSurface(display, candidates[n], window, NULL);
++            }
++        }
++        free(candidates);
++    }
  
      if (surface == EGL_NO_SURFACE) {
          return NULL;
-@@ -171,14 +309,18 @@ CGLWindowRef CGLGetWindow(void *native_window) {
+@@ -171,14 +425,39 @@ CGLWindowRef CGLGetWindow(void *native_window) {
  }
  
  CGL_EXPORT void CGLDestroyWindow(CGLWindowRef window) {
@@ -6542,13 +6665,34 @@ index ffd7fe054..1ff212d34 100644
      context->egl_surface = (EGLSurface) window;
 -    return CGLSetCurrentContext(context);
 +    CGLError result = CGLSetCurrentContext(context);
-+    if (result != kCGLNoError)
++    if (result != kCGLNoError) {
 +        context->egl_surface = oldSurface;
++        return result;
++    }
++    /* darling-lol M57bp: NVIDIA's EGL leaves GL_DRAW_BUFFER and GL_READ_BUFFER
++     * at GL_NONE on a freshly attached window surface when the context was
++     * previously made current without one (CGLSetCurrentContext with
++     * EGL_NO_SURFACE). In that state every draw and every glClear on the
++     * default framebuffer is discarded with no GL error, so the layer
++     * compositor (the League game window) never receives its frame even though
++     * the surface attached and the drawable imported correctly. Select the
++     * buffer the surface actually has; drivers that already report a buffer are
++     * left alone. */
++    if (window != NULL) {
++        GLint drawBuffer = 0;
++        glGetIntegerv(GL_DRAW_BUFFER, &drawBuffer);
++        if (drawBuffer == GL_NONE) {
++            GLint doubleBuffered = 0;
++            glGetIntegerv(GL_DOUBLEBUFFER, &doubleBuffered);
++            glDrawBuffer(doubleBuffered ? GL_BACK : GL_FRONT);
++            glReadBuffer(doubleBuffered ? GL_BACK : GL_FRONT);
++        }
++    }
 +    return result;
  }
  
  static pthread_key_t current_context_key;
-@@ -198,18 +340,42 @@ CGLContextObj CGLGetCurrentContext(void) {
+@@ -198,18 +477,43 @@ CGLContextObj CGLGetCurrentContext(void) {
      return pthread_getspecific(key);
  }
  
@@ -6589,14 +6733,15 @@ index ffd7fe054..1ff212d34 100644
      }
 -
 -    return kCGLNoError; // FIXME
-+    if (!success)
++    if (!success) {
 +        return kCGLBadState;
++    }
 +    pthread_setspecific(key, context);
 +    return kCGLNoError;
  }
  
  CGLError CGLSetFullScreen(CGLContextObj ctx) {
-@@ -223,11 +389,13 @@ CGLError CGLChoosePixelFormat(
+@@ -223,11 +527,13 @@ CGLError CGLChoosePixelFormat(
      CGLPixelFormatObj *result,
      GLint *number_of_screens
  ) {
@@ -6611,7 +6756,7 @@ index ffd7fe054..1ff212d34 100644
      for (int i = 0; i < count; i++) {
          format->attributes[i] = attrs[i];
      }
-@@ -251,6 +419,10 @@ CGLError CGLDescribePixelFormat(
+@@ -251,6 +557,10 @@ CGLError CGLDescribePixelFormat(
      CGLPixelFormatAttribute attr,
      GLint *value
  ) {
@@ -6622,7 +6767,7 @@ index ffd7fe054..1ff212d34 100644
      for (int i = 0; format->attributes[i] != 0; i++) {
          int has_arg = attribute_has_argument(format->attributes[i]);
  
-@@ -304,24 +476,67 @@ GLuint CGLGetPixelFormatRetainCount(CGLPixelFormatObj pixelFormat) {
+@@ -304,15 +614,125 @@ GLuint CGLGetPixelFormatRetainCount(CGLPixelFormatObj pixelFormat) {
  }
  
  CGLError CGLCreateContext(CGLPixelFormatObj pixelFormat, CGLContextObj share, CGLContextObj *resultp) {
@@ -6657,24 +6802,100 @@ index ffd7fe054..1ff212d34 100644
 +    } else if (profile && profile != 0x1000 && profile != 0x3200) {
 +        return kCGLBadValue;
 +    }
++    EGLint usedAttrs = profile == 0x3200 || profile == 0x4100;
 +    EGLContext egl_context = p_eglCreateContext(contextDisplay, contextConfig, egl_share,
-+        profile == 0x3200 || profile == 0x4100 ? contextAttributes : NULL);
++        usedAttrs ? contextAttributes : NULL);
  
      if (egl_context == EGL_NO_CONTEXT) {
-+        fprintf(stderr, "M58DG CGLCreateContext FAILED: display=%p config=%p share=%p p_eglCreateContext=%p\n",
-+            (void*) display, (void*) config, (void*) egl_share, (void*) p_eglCreateContext);
-         return kCGLBadContext;
+-        return kCGLBadContext;
++        EGLint err_original = p_eglGetError ? p_eglGetError() : -1;
++        if (usedAttrs) {
++            /* A driver may reject the explicit core-profile attribute yet still
++             * create the requested version without it, or a default context.
++             * Retry with progressively weaker attribute lists. */
++            EGLint noProfileAttributes[] = {
++                0x3098 /* EGL_CONTEXT_MAJOR_VERSION */, contextAttributes[1],
++                0x30FB /* EGL_CONTEXT_MINOR_VERSION */, contextAttributes[3],
++                EGL_NONE
++            };
++            for (int nivel = 2; nivel <= 3; ++nivel) {
++                if (p_eglGetError)
++                    p_eglGetError(); /* clear any error before the retry */
++                egl_context = p_eglCreateContext(contextDisplay, contextConfig, egl_share,
++                    nivel == 2 ? noProfileAttributes : NULL);
++                if (egl_context != EGL_NO_CONTEXT)
++                    break;
++            }
++        }
++        if (egl_context == EGL_NO_CONTEXT) {
++            /* display/config may be stale (a later CGLRegisterNativeDisplay can
++             * rebind the globals). Re-choose a config with the same attribute
++             * list and retry once. */
++            EGLConfig retry_cfg = NULL;
++            EGLint retry_num = 0;
++            if (p_eglChooseConfig &&
++                p_eglChooseConfig(contextDisplay, attribute_list, &retry_cfg, 1, &retry_num) &&
++                retry_cfg != NULL) {
++                contextConfig = retry_cfg;
++                if (p_eglGetError)
++                    p_eglGetError(); /* clear any error before the retry */
++                egl_context = p_eglCreateContext(contextDisplay, contextConfig, egl_share,
++                    usedAttrs ? contextAttributes : NULL);
++            }
++        }
++        if (egl_context == EGL_NO_CONTEXT && (unsigned) err_original == 0x3008u) {
++            /* EGL_BAD_DISPLAY: the EGLDisplay (and the X connection it was bound
++             * to) went invalid, usually because the AppKit X11Display that
++             * called CGLRegisterNativeDisplay() was deallocated (XCloseDisplay)
++             * without CGL being told. Rebuild the display/config from a
++             * still-live X connection. Sources tried in order: CGL's own private
++             * X connection (stable for the process lifetime), the main CGS
++             * connection, the default display, then plain eglGetDisplay(). The
++             * first source that initialises and yields a config wins. */
++            pthread_mutex_lock(&display_rebuild_mutex);
++            ensure_own_xdisplay();
++            void *cgsDisplay = _CGSNativeDisplay(CGSMainConnectionID());
++            if (own_xdisplay && p_XSync)
++                p_XSync(own_xdisplay, 0);
++            for (int src = 0; src < 4 && egl_context == EGL_NO_CONTEXT; ++src) {
++                EGLDisplay newDisplay = EGL_NO_DISPLAY;
++                if (src == 0)
++                    newDisplay = own_xdisplay ? x11EGLDisplay(own_xdisplay) : EGL_NO_DISPLAY;
++                else if (src == 1)
++                    newDisplay = cgsDisplay ? x11EGLDisplay(cgsDisplay) : EGL_NO_DISPLAY;
++                else if (src == 2)
++                    newDisplay = x11EGLDisplay(EGL_DEFAULT_DISPLAY);
++                else if (p_eglGetDisplay)
++                    newDisplay = p_eglGetDisplay(EGL_DEFAULT_DISPLAY);
++                EGLConfig newConfig = NULL;
++                EGLint newNumConfig = 0;
++                EGLBoolean ini = EGL_FALSE, ch = EGL_FALSE;
++                if (newDisplay != EGL_NO_DISPLAY) {
++                    ini = p_eglInitialize ? p_eglInitialize(newDisplay, NULL, NULL) : EGL_FALSE;
++                    ch = p_eglChooseConfig ? p_eglChooseConfig(newDisplay, attribute_list, &newConfig, 1, &newNumConfig) : EGL_FALSE;
++                }
++                if (!ini || !ch || newConfig == NULL)
++                    continue;
++                display = newDisplay;
++                config = newConfig;
++                num_config = newNumConfig;
++                contextDisplay = newDisplay;
++                contextConfig = newConfig;
++                if (p_eglBindAPI)
++                    p_eglBindAPI(EGL_OPENGL_API);
++                if (p_eglGetError)
++                    p_eglGetError(); /* clear any error before the retry */
++                egl_context = p_eglCreateContext(contextDisplay, contextConfig, egl_share,
++                    usedAttrs ? contextAttributes : NULL);
++            }
++            pthread_mutex_unlock(&display_rebuild_mutex);
++        }
++        if (egl_context == EGL_NO_CONTEXT)
++            return kCGLBadContext;
      }
  
-+    {
-+        static int m58dg_ok = 0;
-+        if (m58dg_ok++ < 5)
-+            fprintf(stderr, "M58DG CGLCreateContext OK display=%p config=%p ctx=%p\n",
-+                (void*) display, (void*) config, (void*) egl_context);
-+    }
-+
      CGLContextObj context = malloc(sizeof(struct _CGLContextObj));
- 
+@@ -320,8 +740,16 @@ CGLError CGLCreateContext(CGLPixelFormatObj pixelFormat, CGLContextObj share, CG
      context->retain_count = 1;
      pthread_mutex_init(&(context->lock), NULL);
      context->egl_context = egl_context;
@@ -6691,7 +6912,7 @@ index ffd7fe054..1ff212d34 100644
  
      *resultp = context;
  
-@@ -333,7 +548,7 @@ CGLContextObj CGLRetainContext(CGLContextObj context) {
+@@ -333,7 +761,7 @@ CGLContextObj CGLRetainContext(CGLContextObj context) {
          return NULL;
      }
  
@@ -6700,7 +6921,7 @@ index ffd7fe054..1ff212d34 100644
      return context;
  }
  
-@@ -342,11 +557,17 @@ void CGLReleaseContext(CGLContextObj context) {
+@@ -342,11 +770,17 @@ void CGLReleaseContext(CGLContextObj context) {
          return;
      }
  
@@ -6721,7 +6942,7 @@ index ffd7fe054..1ff212d34 100644
  
      if (CGLGetCurrentContext() == context) {
          CGLSetCurrentContext(NULL);
-@@ -354,7 +575,11 @@ void CGLReleaseContext(CGLContextObj context) {
+@@ -354,7 +788,11 @@ void CGLReleaseContext(CGLContextObj context) {
  
      pthread_mutex_destroy(&(context->lock));
  
@@ -6734,7 +6955,7 @@ index ffd7fe054..1ff212d34 100644
  
      free(context);
  }
-@@ -383,9 +608,330 @@ CGLError CGLUnlockContext(CGLContextObj context) {
+@@ -383,9 +821,330 @@ CGLError CGLUnlockContext(CGLContextObj context) {
      return kCGLNoError;
  }
  
@@ -7067,7 +7288,7 @@ index ffd7fe054..1ff212d34 100644
  }
  
  CGLError CGLSetParameter(CGLContextObj context, CGLContextParameter parameter, const GLint *value) {
-@@ -394,8 +940,9 @@ CGLError CGLSetParameter(CGLContextObj context, CGLContextParameter parameter, c
+@@ -394,8 +1153,9 @@ CGLError CGLSetParameter(CGLContextObj context, CGLContextParameter parameter, c
  
      if (parameter == kCGLCPSwapInterval)
      {
@@ -7078,7 +7299,7 @@ index ffd7fe054..1ff212d34 100644
          if (success)
              context->swap_interval = v;
          return success ? kCGLNoError : kCGLBadValue;
-@@ -417,14 +964,19 @@ CGLError CGLGetParameter(CGLContextObj context, CGLContextParameter parameter, G
+@@ -417,14 +1177,19 @@ CGLError CGLGetParameter(CGLContextObj context, CGLContextParameter parameter, G
      return kCGLNoError;
  }
  
@@ -7104,6 +7325,24 @@ index ffd7fe054..1ff212d34 100644
 -}
 \ No newline at end of file
 +}
+diff --git a/src/frameworks/OpenGL/include/OpenGL/CGLInternal.h b/src/frameworks/OpenGL/include/OpenGL/CGLInternal.h
+index 1d0b10e65..236088f14 100644
+--- a/src/frameworks/OpenGL/include/OpenGL/CGLInternal.h
++++ b/src/frameworks/OpenGL/include/OpenGL/CGLInternal.h
+@@ -16,6 +16,13 @@ CGL_EXPORT CGLError CGLRegisterNativeDisplay(void *native_display);
+ CGL_EXPORT CGLWindowRef CGLGetWindow(void *native_window);
+ CGL_EXPORT void CGLDestroyWindow(CGLWindowRef window);
+ 
++/* The X visual (the window-capable EGL config's EGL_NATIVE_VISUAL_ID) that EGL
++ * accepts window surfaces for. AppKit creates its X11 windows with this
++ * visual: eglCreateWindowSurface rejects any other visual with EGL_BAD_CONFIG,
++ * and on some drivers (NVIDIA/XWayland) GLX advertises a disjoint visual set,
++ * so a glXChooseVisual window can never get a CGL window surface. */
++CGL_EXPORT CGLError CGLGetWindowVisual(unsigned int *visual);
++
+ CGL_EXPORT CGLError CGLContextMakeCurrentAndAttachToWindow(CGLContextObj context, CGLWindowRef window);
+ CGLError CGLSetSurface(CGLContextObj gl, CGSConnectionID cid, CGSWindowID wid, CGSSurfaceID sid);
+ CGLContextObj CGWindowContextCreate(CGSConnectionID cid, CGSWindowID wid, CFDictionaryRef options);
 diff --git a/src/frameworks/OpenGL/include/OpenGL/CGLTypes.h b/src/frameworks/OpenGL/include/OpenGL/CGLTypes.h
 index 7d5eda01a..803ac02d3 100644
 --- a/src/frameworks/OpenGL/include/OpenGL/CGLTypes.h

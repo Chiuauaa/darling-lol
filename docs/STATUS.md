@@ -1,6 +1,33 @@
 # Snapshot status — 2026-10-14
 
-This repository preserves a development runtime, including historical experiments. All 29 patches apply to their pinned revisions and the exported source matches the development tree for the patched files. A fresh checkout/build/install has not been validated end to end on another machine. The normal workflow uses manual client installation and play, without debugger attachment, client API calls or input automation.
+This repository preserves a development runtime, including historical experiments. All 30 patches apply to their pinned revisions and the exported source matches the development tree for the patched files. A fresh checkout/build/install has not been validated end to end on another machine. The normal workflow uses manual client installation and play, without debugger attachment, client API calls or input automation.
+
+## Bring-up status on this machine, 2026-10-18 (NVIDIA)
+
+The Riot Client path works end to end here: the installer, the splash and the
+install-path picker render, and the user confirmed the launcher itself
+(`RiotClientServices`, the Electron Riot Client, `LeagueClientUx` and
+`LeagueClient` all up). The League **game** process starts, reaches its game
+loop (`GAMESTATE_GAMELOOP`) and the game window now **renders**: the
+`GL_DRAW_BUFFER = GL_NONE` defect is fixed in
+`CGLContextMakeCurrentAndAttachToWindow`, and a practice match on Summoner's
+Rift showed the full HUD at 59 FPS / 9 ms with zero `Metal Device timed out`
+entries. See
+[troubleshooting](TROUBLESHOOTING.md#nvidia-the-window-attaches-and-the-frame-is-dropped-fixed-2026-10-18).
+
+On this machine the game is **CPU-bound**, not GPU- or driver-bound: the GTX
+1070 idles at 14–16% while the i3-8100 (4 threads, no SMT) sits near saturation
+(`load` 8–12, with ~27% of CPU time in the kernel). The League client's Chromium
+stack alone uses ~1.8 cores during a match and the desktop plus background apps
+another ~0.5, so the game's threads contend for the four threads and FPS degrades
+as the match progresses. Measurements, the client-load breakdown and the open
+experiments are in
+[WORKLOG-FPS-2026-10-18.md](WORKLOG-FPS-2026-10-18.md). The FPS table below is
+still from the AMD RADV machine.
+
+One footgun from this session: `/tmp/metal-no-drawable-vram` `abort()`s the game
+on NVIDIA (crash-loop at Metal resource creation). It is documented in
+[troubleshooting](TROUBLESHOOTING.md#nvidia-tmpmetal-no-drawable-vram-aborts-the-game-2026-10-18).
 
 ## Game FPS, 2026-10-13/14
 

@@ -4472,916 +4472,22 @@ index 0000000..31fa646
 +}
 +
 +#endif
-diff --git a/AppKit/X11.backend/X11Window.h b/AppKit/X11.backend/X11Window.h
-index bfe3839a..e8c8828f 100644
---- a/AppKit/X11.backend/X11Window.h
-+++ b/AppKit/X11.backend/X11Window.h
-@@ -26,7 +26,7 @@
- #import <X11/Xresource.h>
- #import <X11/Xlocale.h>
+diff --git a/AppKit/X11.backend/X11SubWindow.m b/AppKit/X11.backend/X11SubWindow.m
+index 738ab457..dacffe7e 100644
+--- a/AppKit/X11.backend/X11SubWindow.m
++++ b/AppKit/X11.backend/X11SubWindow.m
+@@ -27,6 +27,11 @@
+     );
  
--@class X11Display, CAWindowOpenGLContext, NSWindow, O2Context;
-+@class X11Display, CAWindowOpenGLContext, NSWindow, O2Context, NSTimer;
- 
- @interface X11Window : CGWindow {
-     int _level; // TODO: care about this value
-@@ -47,8 +47,30 @@
-     BOOL _mapped;
-     CGPoint _lastMotionPos;
-     BOOL _isModal;
-+    BOOL _overrideRedirect;
-+    BOOL _fullscreenRequested;
-     BOOL _isOpaque;
-     BOOL _hasShadow;
-+    NSTimer *_remoteFrameTimer;
-+    Window _remoteFrameWindow;
-+    GC _remoteFrameGC;
-+    unsigned int _remoteFrameSequence, _remoteFrameWidth, _remoteFrameHeight;
-+    BOOL _remoteFrameValid;
-+    char _remoteFramePath[128];
-+    XWindowAttributes _remoteFrameTargets[17];
-+    unsigned _remoteFrameTargetCount;
-+    double _remoteFrameTargetRefresh;
-+    void *_remoteFrameMapping;
-+    size_t _remoteFrameMappingSize;
-+    char _remoteFrameMappingPath[128];
-+    double _remoteFrameSelectionRefresh;
-+    void *_remoteFrameShm;
-+    void (*_remoteFrameShmDestroy)(void *);
-+    int (*_remoteFrameShmPut)(void *, Drawable, GC, const void *, size_t);
-+    int (*_remoteFrameShmStart)(void *, Drawable, GC, const char *);
-+    BOOL _remoteFrameShmPumping;
-+    BOOL _remoteFrameSoftwarePublisher;
-+    BOOL _remoteFrameTimerSlow;
- 
- @public
-     XIC _xic;
-@@ -60,9 +82,9 @@
- - (Visual *) visual;
- - (Drawable) drawable;
- - (NSPoint) transformPoint: (NSPoint) pos;
--- (O2Rect) transformFrame: (O2Rect) frame;
- 
- - (Window) windowHandle;
-+- (BOOL) handleRemoteFrameExpose: (Window) window;
- 
- - (void) frameChanged;
- - (void) setLastKnownCursorPosition: (CGPoint) point;
-diff --git a/AppKit/X11.backend/X11Window.m b/AppKit/X11.backend/X11Window.m
-index f4925b66..f9dd38cc 100644
---- a/AppKit/X11.backend/X11Window.m
-+++ b/AppKit/X11.backend/X11Window.m
-@@ -23,6 +23,7 @@
- #import <AppKit/NSPopUpWindow.h>
- #import <AppKit/NSRaise.h>
- #import <AppKit/NSWindow.h>
-+#import <AppKit/NSScreen.h>
- #import <Foundation/NSBundle.h>
- #import <Foundation/NSException.h>
- #import <Foundation/NSMutableData.h>
-@@ -38,6 +39,34 @@
- #import "X11Window.h"
- #import <X11/Xatom.h>
- #import <X11/Xutil.h>
-+#import <X11/extensions/shape.h>
-+#include <fcntl.h>
-+#include <stdint.h>
-+#include <stdlib.h>
-+#include <unistd.h>
-+#include <dirent.h>
-+#include <string.h>
-+#include <sys/stat.h>
-+#include <sys/mman.h>
-+#include <dlfcn.h>
-+#include <sys/signal.h>
-+#include <errno.h>
-+
-+#define DARLING_CA_FRAME_MAGIC 0x43414652u
-+#define DARLING_CA_FRAME_BUFFERED_MAGIC 0x43414632u
-+static size_t framePayloadOffset(uint32_t magic, uint32_t format) {
-+    return magic == DARLING_CA_FRAME_BUFFERED_MAGIC && (format & 0x40000000u)
-+        ? 32u * 1024u * 1024u : 0;
-+}
-+typedef struct {
-+    uint32_t magic;
-+    volatile uint32_t sequence;
-+    uint32_t width;
-+    uint32_t height;
-+    uint32_t bytesPerRow;
-+    uint32_t pixelFormat;
-+    uint64_t dataSize;
-+} DarlingCARemoteFrame;
- 
- @implementation X11Window
- 
-@@ -158,7 +187,7 @@ static NSData *makeWindowIcon() {
-     X11Display* x11disp = (X11Display *) [NSDisplay currentDisplay];
-     _display = [x11disp display];
- 
--    _frame = [self transformFrame: [delegate frame]];
-+    _frame = [x11disp rootRectForFrame: [delegate frame]];
-     BOOL isPanel = [delegate isKindOfClass: [NSPanel class]];
-     if (isPanel && _styleMask & NSDocModalWindowMask)
-         _styleMask = NSBorderlessWindowMask;
-@@ -193,8 +222,16 @@ static NSData *makeWindowIcon() {
- 
-     XSetWindowAttributes xattr;
-     unsigned long xattr_mask;
--    xattr.override_redirect =
--            _styleMask == NSBorderlessWindowMask ? True : False;
-+    BOOL isGame = X11IsLeagueGameWindow(_display, None, delegate);
-+
-+    // A borderless game is still a focusable application window. Leaving it
-+    // override-redirect makes XWayland bypass compositor keyboard activation.
-+    // Menus and nonactivating popups keep their unmanaged behavior.
-+    xattr.override_redirect = !isGame && _styleMask == NSBorderlessWindowMask &&
-+            ([delegate isKindOfClass:[NSMenuWindow class]] ||
-+             [delegate isKindOfClass:[NSPopUpWindow class]] ||
-+             ![delegate canBecomeKeyWindow]) ? True : False;
-+    _overrideRedirect = xattr.override_redirect;
-     xattr_mask = CWOverrideRedirect | CWColormap;
-     xattr.colormap = cmap;
- 
-@@ -206,6 +243,12 @@ static NSData *makeWindowIcon() {
-             (_visualInfo == NULL) ? CopyFromParent : _visualInfo->visual,
-             xattr_mask, &xattr);
- 
-+    /* Keep Cocoa's process identifier available to cross-process activation. */
-+    unsigned long windowPID = (unsigned long)getpid();
-+    XChangeProperty(_display, _window, XInternAtom(_display, "_NET_WM_PID", False),
-+                    XA_CARDINAL, 32, PropModeReplace,
-+                    (unsigned char *)&windowPID, 1);
-+
-     [self syncDelegateProperties];
- 
-     Atom atm = XInternAtom(_display, "WM_DELETE_WINDOW", False);
-@@ -217,6 +260,15 @@ static NSData *makeWindowIcon() {
-                             .res_class = (char *) name};
-     XSetClassHint(_display, _window, &classHint);
- 
-+    if (isGame && !(_styleMask & NSTitledWindowMask)) {
-+        /* darling-lol: never let the compositor scan out this parent window
-+         * directly (bypass=2): Metal/OpenGL draw into a child window, so direct
-+         * scanout shows black. EWMH fullscreen is requested in setStyleMask. */
-+        unsigned long bypass = 2;
-+        XChangeProperty(_display, _window, XInternAtom(_display, "_NET_WM_BYPASS_COMPOSITOR", False),
-+                        XA_CARDINAL, 32, PropModeReplace, (unsigned char *)&bypass, 1);
-+    }
-+
-     XSetWindowBackgroundPixmap(_display, _window, None);
- 
-     _isModal = [delegate isSheet] || [NSApp modalWindow] == delegate;
-@@ -266,6 +318,13 @@ static NSData *makeWindowIcon() {
- 
-     [self setWindowIcon];
- 
-+    /* Chromium windows consume cross-process CA frames. League's native Metal window owns its
-+     * drawable; a same-size client surface must never be raised above that drawable. */
-+    if (!isGame)
-+        _remoteFrameTimer = [[NSTimer scheduledTimerWithTimeInterval: 1.0 / 60.0
-+            target: self selector: @selector(presentRemoteCAFrame:)
-+            userInfo: nil repeats: YES] retain];
-+
+     [self show];
++    /* The window creation and map requests above are still sitting in this
++     * connection's output buffer. Anything that looks the window up on another
++     * connection (EGL, in particular) would not find it and would fail with
++     * EGL_BAD_CONFIG, so make the server process them before returning. */
++    XSync(_display, False);
      return self;
  }
  
-@@ -279,24 +338,30 @@ static NSData *makeWindowIcon() {
-     return _styleMask;
- }
- 
--- (void) setStyleMaskInternal: (NSUInteger) mask force: (BOOL) force {
--    if (force || (mask & NSWindowStyleMaskResizable) !=
--                         (_styleMask & NSWindowStyleMaskResizable)) {
--        XSizeHints *sh = XAllocSizeHints();
--        if (mask & NSWindowStyleMaskResizable) {
--            // Make resizable
--            sh->flags = 0;
--        } else {
--            // Make non-resizable
--            sh->flags = PMinSize | PMaxSize;
--            sh->min_width = sh->max_width = _frame.size.width;
--            sh->min_height = sh->max_height = _frame.size.height;
--        }
--
--        XSetWMSizeHints(_display, _window, sh, XA_WM_NORMAL_HINTS);
--        XFree(sh);
-+/* A borderless application covering a monitor needs EWMH fullscreen so the
-+ * compositor places it above desktop panels. Compare full monitor bounds,
-+ * never the work area, and leave unmanaged menus/popups alone. */
-+- (BOOL) wantsFullscreenWithStyleMask: (NSUInteger) mask rootFrame: (O2Rect) frame {
-+    if (_overrideRedirect || [_delegate isKindOfClass:[NSPanel class]] ||
-+        [_delegate isKindOfClass:[NSMenuWindow class]] || [_delegate isKindOfClass:[NSPopUpWindow class]] ||
-+        [_delegate isKindOfClass:NSClassFromString(@"NSToolTipWindow")]) return NO;
-+    if (mask & NSWindowStyleMaskFullScreen) return YES;
-+    if (mask & NSTitledWindowMask) return NO;
-+    X11Display *display = (X11Display *) [NSDisplay currentDisplay];
-+    for (NSScreen *screen in [display screens]) {
-+        if (!NSIsEmptyRect([screen frame]) &&
-+            NSEqualRects([display rootRectForFrame: [screen frame]], frame))
-+            return YES;
-     }
-+    return NO;
-+}
- 
-+- (void) requestFullscreen: (BOOL) fullscreen force: (BOOL) force {
-+    if (fullscreen) {
-+        unsigned long bypass = 2;
-+        XChangeProperty(_display, _window, XInternAtom(_display,"_NET_WM_BYPASS_COMPOSITOR",False),
-+                        XA_CARDINAL,32,PropModeReplace,(unsigned char *)&bypass,1);
-+    }
-     if (!_mapped) {
-         long states[2];
-         int states_cnt = 0;
-@@ -304,7 +369,7 @@ static NSData *makeWindowIcon() {
-             states[states_cnt++] =
-                     (long) XInternAtom(_display, "_NET_WM_STATE_MODAL", False);
-         }
--        if (mask & NSWindowStyleMaskFullScreen) {
-+        if (fullscreen) {
-             states[states_cnt++] = (long) XInternAtom(
-                     _display, "_NET_WM_STATE_FULLSCREEN", False);
-         }
-@@ -312,14 +377,13 @@ static NSData *makeWindowIcon() {
-                         XInternAtom(_display, "_NET_WM_STATE", False), XA_ATOM,
-                         32, PropModeReplace, (const unsigned char *) states,
-                         states_cnt);
--    } else if (force || ((mask & NSWindowStyleMaskFullScreen) !=
--                         (_styleMask & NSWindowStyleMaskFullScreen))) {
-+    } else if (force || fullscreen != _fullscreenRequested) {
-         XClientMessageEvent event = {0};
-         event.type = ClientMessage;
-         event.window = _window;
-         event.message_type = XInternAtom(_display, "_NET_WM_STATE", False);
-         event.format = 32;
--        event.data.l[0] = (mask & NSWindowStyleMaskFullScreen) ? 1 : 2;
-+        event.data.l[0] = fullscreen ? 1 : 0; /* EWMH ADD / REMOVE, not TOGGLE */
-         event.data.l[1] =
-                 (long) XInternAtom(_display, "_NET_WM_STATE_FULLSCREEN", False);
-         event.data.l[3] = 1;
-@@ -327,6 +391,35 @@ static NSData *makeWindowIcon() {
-                    SubstructureNotifyMask | SubstructureRedirectMask,
-                    (XEvent *) &event);
-     }
-+    _fullscreenRequested = fullscreen;
-+    XFlush(_display);
-+}
-+
-+- (void) setStyleMaskInternal: (NSUInteger) mask force: (BOOL) force {
-+    if (force || (mask & NSWindowStyleMaskResizable) !=
-+                         (_styleMask & NSWindowStyleMaskResizable)) {
-+        XSizeHints *sh = XAllocSizeHints();
-+        if (mask & NSWindowStyleMaskResizable) {
-+            // Make resizable
-+            sh->flags = 0;
-+        } else {
-+            if (X11IsLeagueGameWindow(_display, _window, _delegate)) {
-+                // A fixed-size window cannot be made EWMH fullscreen by Mutter,
-+                // and a stale minimum would block switching to a smaller mode.
-+                sh->flags = 0;
-+            } else {
-+                // Make non-resizable
-+                sh->flags = PMinSize | PMaxSize;
-+                sh->min_width = sh->max_width = _frame.size.width;
-+                sh->min_height = sh->max_height = _frame.size.height;
-+            }
-+        }
-+
-+        XSetWMSizeHints(_display, _window, sh, XA_WM_NORMAL_HINTS);
-+        XFree(sh);
-+    }
-+
-+    [self requestFullscreen:[self wantsFullscreenWithStyleMask:mask rootFrame:_frame] force:force];
- }
- 
- - (void) setStyleMask: (NSUInteger) mask {
-@@ -338,7 +431,6 @@ static NSData *makeWindowIcon() {
- }
- 
- + (void) removeDecorationForWindow: (Window) w onDisplay: (Display *) dpy {
--    return;
-     struct {
-         unsigned long flags;
-         unsigned long functions;
-@@ -358,6 +450,7 @@ static NSData *makeWindowIcon() {
-     if (!_mapped) {
-         XMapWindow(_display, _window);
-         _mapped = YES;
-+        _remoteFrameTargetRefresh = 0;
-     }
- }
- 
-@@ -377,15 +470,27 @@ static NSData *makeWindowIcon() {
- - (void) syncDelegateProperties {
-     long mask = KeyPressMask | KeyReleaseMask | ExposureMask |
-                 StructureNotifyMask | EnterWindowMask | LeaveWindowMask |
--                ButtonPressMask | ButtonReleaseMask | ButtonMotionMask |
--                VisibilityChangeMask | FocusChangeMask |
-+                ButtonPressMask | ButtonReleaseMask | ButtonMotionMask | PointerMotionMask |
-+                VisibilityChangeMask | FocusChangeMask | PropertyChangeMask |
-                 SubstructureRedirectMask;
- 
--    if ([_delegate acceptsMouseMovedEvents]) {
--        mask |= PointerMotionMask;
--    }
-+    /* Motion also restores a cursor hidden while typing. App-level motion
-+     * delivery is still filtered by acceptsMouseMovedEvents in X11Display. */
-     XSelectInput(_display, _window, mask);
- 
-+    /* Mouse-transparent windows must not steal crossing events from the
-+     * view below them. Filtering dispatched events leaves X11 hit testing
-+     * unchanged and can repeatedly hide/recreate tooltip windows. */
-+    if ([_delegate respondsToSelector: @selector(ignoresMouseEvents)]) {
-+        if ([_delegate ignoresMouseEvents])
-+            XShapeCombineRectangles(_display, _window, ShapeInput,
-+                                    0, 0, NULL, 0, ShapeSet, Unsorted);
-+        else
-+            XShapeCombineMask(_display, _window, ShapeInput,
-+                              0, 0, None, ShapeSet);
-+        XFlush(_display);
-+    }
-+
-     // TODO: background color
- }
- 
-@@ -393,6 +498,28 @@ static NSData *makeWindowIcon() {
-     // This is essentially dealloc; we release our contexts
-     // and windows, but unlike dealloc, this method can be called
-     // several times, so set everything to nil/NULL/0.
-+    [_remoteFrameTimer invalidate];
-+    [_remoteFrameTimer release];
-+    _remoteFrameTimer = nil;
-+    if (_remoteFrameShm) {
-+        _remoteFrameShmDestroy(_remoteFrameShm);
-+        _remoteFrameShm = NULL;
-+        _remoteFrameShmPumping = NO;
-+    }
-+    if (_remoteFrameMapping) {
-+        munmap(_remoteFrameMapping, _remoteFrameMappingSize);
-+        _remoteFrameMapping = NULL;
-+        _remoteFrameMappingSize = 0;
-+    }
-+
-+    if (_remoteFrameWindow) {
-+        [(X11Display *) [NSDisplay currentDisplay] setWindow: nil forID: _remoteFrameWindow];
-+        if (_remoteFrameGC) XFreeGC(_display, _remoteFrameGC);
-+        XDestroyWindow(_display, _remoteFrameWindow);
-+        _remoteFrameWindow = 0;
-+        _remoteFrameGC = NULL;
-+        _remoteFrameValid = NO;
-+    }
-     [_context release];
-     _context = nil;
- 
-@@ -421,6 +548,392 @@ static NSData *makeWindowIcon() {
-     }
- }
- 
-+- (void) setRemoteFrameTimerSlow: (BOOL) slow {
-+    if (_remoteFrameTimerSlow == slow) return;
-+    _remoteFrameTimerSlow = slow;
-+    [_remoteFrameTimer invalidate];
-+    [_remoteFrameTimer release];
-+    _remoteFrameTimer = [[NSTimer scheduledTimerWithTimeInterval: slow ? 0.25 : 1.0 / 60.0
-+        target: self selector: @selector(presentRemoteCAFrame:)
-+        userInfo: nil repeats: YES] retain];
-+}
-+
-+- (BOOL) presentRemoteCAFrame: (NSTimer *) timer {
-+    static unsigned char *pixels;
-+    static size_t pixelCapacity;
-+    /* Slots are selected by dimensions, not by window ownership. A fullscreen client slot can
-+     * match the game and create a black presentation child above Metal's X11SubWindow. Keep
-+     * the native game renderer authoritative, including calls from openGLFlushBuffer/expose. */
-+    if (X11IsLeagueGameWindow(_display, _window, _delegate)) return NO;
-+    if (!_mapped) return NO;
-+    double now = CFAbsoluteTimeGetCurrent();
-+    /* X geometry queries are synchronous round trips. Cache stable targets
-+     * across animation ticks, invalidating on native resize/mapping changes. */
-+    if (!_remoteFrameTargetCount || now >= _remoteFrameTargetRefresh) {
-+        XWindowAttributes attributes;
-+        if (!XGetWindowAttributes(_display, _window, &attributes) ||
-+            attributes.map_state != IsViewable)
-+            return NO;
-+        _remoteFrameTargetCount = 1;
-+        _remoteFrameTargets[0] = attributes;
-+        Window root, parent, *children = NULL;
-+        unsigned childCount = 0;
-+        if (XQueryTree(_display, _window, &root, &parent, &children, &childCount)) {
-+            for (unsigned i = 0; i < childCount && _remoteFrameTargetCount < 17; ++i)
-+                if (children[i] != _remoteFrameWindow &&
-+                    XGetWindowAttributes(_display, children[i],
-+                        &_remoteFrameTargets[_remoteFrameTargetCount]))
-+                    ++_remoteFrameTargetCount;
-+        }
-+        if (children) XFree(children);
-+        _remoteFrameTargetRefresh = now + 1.0;
-+    }
-+    XWindowAttributes *frameTargets = _remoteFrameTargets;
-+    unsigned frameTargetCount = _remoteFrameTargetCount;
-+    DarlingCARemoteFrame before, after;
-+    if (_remoteFrameValid && _remoteFrameMapping &&
-+        (((DarlingCARemoteFrame *)_remoteFrameMapping)->sequence & 1)) {
-+        XRaiseWindow(_display, _remoteFrameWindow);
-+        XFlush(_display);
-+        return YES;
-+    }
-+    /* darling-lol M58c diagnostic (opt-in via M58_PRES_TRACE): one character
-+     * per event appended to /dev/shm/m58c-present-<pid> so the consumer's
-+     * behavior can be observed from the host without guest logging noise.
-+     * t=timer fired, s=no candidate slot, S=slot chosen, s=same sequence,
-+     * b=blit performed, v=header validation failed. */
-+    int (*_tputc)(int) = NULL;
-+    (void) _tputc;
-+    static FILE *tlog;
-+    if (getenv("M58_PRES_TRACE")) {
-+        if (!tlog) {
-+            char tpath[128];
-+            snprintf(tpath, sizeof(tpath),
-+                "/dev/shm/m58c-present-%d", (int) getpid());
-+            tlog = fopen(tpath, "a");
-+        }
-+        if (tlog) {
-+            fputc('t', tlog);
-+            fflush(tlog);
-+        }
-+    }
-+    /* darling-lol M58c: the publisher side now writes one slot file per
-+     * process (/dev/shm/darling-ca-frame-<uid>-<pid>) because concurrent
-+     * publishers corrupt a shared slot's seqlock. Several processes publish
-+     * same-size surfaces (measured: the browser's own surface is all black
-+     * while the GPU's compositor output carries the real frame), so scan
-+     * every publisher's slot and display the most recently updated one that
-+     * actually contains pixels; an all-black frame is only used when nothing
-+     * else is available. */
-+    char path[128], bestPath[128], bestBlackPath[128];
-+    /* A window no publisher has a slot for (a Metal game window never gets one) used to rescan /dev/shm on every
-+     * 60 Hz tick: opendir, readdir and stat/open/pread/close per slot file on the main thread. */
-+    if (!_remoteFrameMapping && now < _remoteFrameSelectionRefresh)
-+        return _remoteFrameValid;
-+    if (_remoteFrameMapping && now < _remoteFrameSelectionRefresh) {
-+        snprintf(path, sizeof(path), "%s", _remoteFrameMappingPath);
-+        goto selectedFrame;
-+    }
-+    _remoteFrameSelectionRefresh = now + 0.25;
-+    bestPath[0] = bestBlackPath[0] = '\0';
-+    uint64_t bestMtime = 0, bestBlackMtime = 0;
-+    BOOL bestSoftware = NO;
-+
-+    char prefix[32];
-+    snprintf(prefix, sizeof(prefix), "darling-ca-frame-%u-", getuid());
-+    size_t prefixLen = strlen(prefix);
-+    DIR *dir = opendir("/dev/shm");
-+    if (dir) {
-+        struct dirent *ent;
-+        while ((ent = readdir(dir)) != NULL) {
-+            if (strncmp(ent->d_name, prefix, prefixLen) != 0)
-+                continue;
-+            char candidate[128];
-+            snprintf(candidate, sizeof(candidate), "/dev/shm/%s",
-+                ent->d_name);
-+            struct stat st;
-+            if (stat(candidate, &st) != 0)
-+                continue;
-+            uint64_t updateTime = (uint64_t)st.st_mtimespec.tv_sec * 1000000000u +
-+                                  st.st_mtimespec.tv_nsec;
-+            DarlingCARemoteFrame head = {0};
-+            int cfd = open(candidate, O_RDONLY);
-+            if (cfd < 0)
-+                continue;
-+            BOOL ok = (pread(cfd, &head, sizeof(head), 0) == sizeof(head) &&
-+                (head.magic == DARLING_CA_FRAME_MAGIC || head.magic == DARLING_CA_FRAME_BUFFERED_MAGIC) &&
-+                !(head.sequence & 1) &&
-+                head.width && head.height &&
-+                head.bytesPerRow >= head.width * 4 &&
-+                head.dataSize == (uint64_t)head.bytesPerRow * head.height &&
-+                head.dataSize <= 64u * 1024u * 1024u);
-+            close(cfd);
-+            BOOL matchesWindow = NO;
-+            for (unsigned i = 0; i < frameTargetCount; ++i)
-+                if (head.width == (unsigned)frameTargets[i].width &&
-+                    head.height == (unsigned)frameTargets[i].height)
-+                    matchesWindow = YES;
-+            if (!ok || !matchesWindow)
-+                continue;
-+
-+            /* Peek the top rows to distinguish a rendered frame from an
-+             * empty (all-zero) surface of the same size. */
-+            BOOL hasPixels = NO;
-+            size_t peekRows = head.height < 40 ? (size_t) head.height : 40;
-+            size_t peekLen = peekRows * head.bytesPerRow;
-+            unsigned char peek[40 * 4096];
-+            if (peekLen > sizeof(peek))
-+                peekLen = sizeof(peek);
-+            int pfd = open(candidate, O_RDONLY);
-+            if (pfd >= 0) {
-+                if (pread(pfd, peek, peekLen, sizeof(head) + framePayloadOffset(head.magic, head.pixelFormat)) ==
-+                    (ssize_t) peekLen) {
-+                    for (size_t i = 0; i + 3 < peekLen; i += 4) {
-+                        if (peek[i] | peek[i + 1] | peek[i + 2]) {
-+                            hasPixels = YES;
-+                            break;
-+                        }
-+                    }
-+                }
-+                close(pfd);
-+            }
-+
-+            if (hasPixels) {
-+                BOOL software = (head.pixelFormat & 0x80000000u) != 0;
-+                if ((software && !bestSoftware) ||
-+                    (software == bestSoftware && updateTime > bestMtime)) {
-+                    bestSoftware = software;
-+                    bestMtime = updateTime;
-+                    snprintf(bestPath, sizeof(bestPath), "%s", candidate);
-+                }
-+            } else if (updateTime > bestBlackMtime) {
-+                bestBlackMtime = updateTime;
-+                snprintf(bestBlackPath, sizeof(bestBlackPath), "%s", candidate);
-+            }
-+        }
-+        closedir(dir);
-+    }
-+
-+    /* Keep a software owner across popup updates while the presented size
-+     * still belongs to this window. After a real resize, retaining that owner
-+     * can strand us on its popup slot even though a matching readback frame
-+     * is ready from another publisher. Let normal candidate selection make
-+     * that handoff when the old presentation no longer matches a target. */
-+    BOOL presentationMatchesTarget = NO;
-+    for (unsigned i = 0; i < frameTargetCount; ++i)
-+        if (_remoteFrameWidth == (unsigned)frameTargets[i].width &&
-+            _remoteFrameHeight == (unsigned)frameTargets[i].height)
-+            presentationMatchesTarget = YES;
-+    if (_remoteFrameSoftwarePublisher && _remoteFrameMapping && !bestSoftware &&
-+        presentationMatchesTarget) {
-+        const char *pidText = strrchr(_remoteFrameMappingPath, '-');
-+        int publisher = pidText ? atoi(pidText + 1) : 0;
-+        if (publisher > 0 && (kill(publisher, 0) == 0 || errno != ESRCH)) {
-+            snprintf(path, sizeof(path), "%s", _remoteFrameMappingPath);
-+            goto selectedFrame;
-+        }
-+    }
-+    if (bestPath[0] != '\0')
-+        snprintf(path, sizeof(path), "%s", bestPath);
-+    else if (bestBlackPath[0] != '\0')
-+        snprintf(path, sizeof(path), "%s", bestBlackPath);
-+    else {
-+        /* A writer's odd sequence is a temporary gap, not a hidden window.
-+         * Keep the last complete frame instead of exposing local GL pixels. */
-+        if (tlog) { fputc('S', tlog); }
-+        if (!_remoteFrameMapping) _remoteFrameSelectionRefresh = now + 0.5;
-+        return _remoteFrameValid;
-+    }
-+
-+    if (tlog) { fputc('S', tlog); }
-+
-+    /* Only the presentation child owns remote pixels. GL swaps in sibling
-+     * views cannot clear it, so unchanged frames need no repeated pixel copy. */
-+selectedFrame:
-+    if (!_remoteFrameMapping || strcmp(_remoteFrameMappingPath, path)) {
-+        int fd = open(path, O_RDONLY);
-+        if (fd < 0) return _remoteFrameValid;
-+        struct stat st;
-+        if (fstat(fd, &st) || st.st_size < sizeof(before) ||
-+            st.st_size > sizeof(before) + 64u * 1024u * 1024u) {
-+            close(fd); return _remoteFrameValid;
-+        }
-+        void *mapping = mmap(NULL, st.st_size, PROT_READ, MAP_SHARED, fd, 0);
-+        close(fd);
-+        if (mapping == MAP_FAILED) return _remoteFrameValid;
-+        if (_remoteFrameMapping) munmap(_remoteFrameMapping, _remoteFrameMappingSize);
-+        _remoteFrameMapping = mapping;
-+        _remoteFrameSoftwarePublisher = NO;
-+        _remoteFrameMappingSize = st.st_size;
-+        snprintf(_remoteFrameMappingPath, sizeof(_remoteFrameMappingPath), "%s", path);
-+    }
-+    memcpy(&before, _remoteFrameMapping, sizeof(before));
-+    __sync_synchronize();
-+    if ((before.magic != DARLING_CA_FRAME_MAGIC && before.magic != DARLING_CA_FRAME_BUFFERED_MAGIC) || (before.sequence & 1) ||
-+        !before.width || !before.height || before.bytesPerRow < before.width * 4 ||
-+        before.dataSize != (uint64_t)before.bytesPerRow * before.height ||
-+        framePayloadOffset(before.magic, before.pixelFormat) > _remoteFrameMappingSize - sizeof(before) ||
-+        before.dataSize > _remoteFrameMappingSize - sizeof(before) - framePayloadOffset(before.magic, before.pixelFormat))
-+        return _remoteFrameValid;
-+    if (before.pixelFormat & 0x80000000u) _remoteFrameSoftwarePublisher = YES;
-+    BOOL matchesTarget = NO;
-+    for (unsigned i = 0; i < frameTargetCount; ++i)
-+        if (before.width == (unsigned)frameTargets[i].width &&
-+            before.height == (unsigned)frameTargets[i].height) matchesTarget = YES;
-+    /* A GPU process may publish several windows into its slot. Never resize
-+     * our presentation child to another window's intervening surface. */
-+    if (!matchesTarget) return _remoteFrameValid;
-+    int frameX = 0, frameY = 0;
-+    for (unsigned i = 0; i < frameTargetCount; ++i) {
-+        if (before.width == (unsigned)frameTargets[i].width &&
-+            before.height == (unsigned)frameTargets[i].height) {
-+            if (i) { frameX = frameTargets[i].x; frameY = frameTargets[i].y; }
-+            break;
-+        }
-+    }
-+    if (_remoteFrameWindow)
-+        XMoveWindow(_display, _remoteFrameWindow, frameX, frameY);
-+    if (_remoteFrameShmPumping && _remoteFrameWidth == before.width &&
-+        _remoteFrameHeight == before.height) {
-+        _remoteFrameShmStart(_remoteFrameShm, _remoteFrameWindow, _remoteFrameGC, path);
-+        if (!_remoteFrameValid)
-+            _remoteFrameShmPut(_remoteFrameShm, _remoteFrameWindow, _remoteFrameGC, NULL, 0);
-+        XRaiseWindow(_display, _remoteFrameWindow);
-+        XFlush(_display);
-+        _remoteFrameSequence = before.sequence;
-+        snprintf(_remoteFramePath, sizeof(_remoteFramePath), "%s", path);
-+        _remoteFrameValid = YES;
-+        return YES;
-+    }
-+    if (_remoteFrameValid && _remoteFrameWindow &&
-+        _remoteFrameSequence == before.sequence &&
-+        _remoteFrameWidth == before.width && _remoteFrameHeight == before.height &&
-+        strcmp(_remoteFramePath, path) == 0) {
-+        XRaiseWindow(_display, _remoteFrameWindow);
-+        XFlush(_display);
-+        return YES;
-+    }
-+    if (pixelCapacity < before.dataSize) {
-+        unsigned char *newPixels = realloc(pixels, before.dataSize);
-+        if (!newPixels) {
-+            return _remoteFrameValid;
-+        }
-+        pixels = newPixels;
-+        pixelCapacity = before.dataSize;
-+    }
-+    memcpy(pixels, (char *)_remoteFrameMapping + sizeof(before) + framePayloadOffset(before.magic, before.pixelFormat), before.dataSize);
-+    __sync_synchronize();
-+    memcpy(&after, _remoteFrameMapping, sizeof(after));
-+    if (after.sequence != before.sequence || (after.sequence & 1)) {
-+        if (tlog) { fputc('T', tlog); }
-+        return _remoteFrameValid;
-+    }
-+
-+    XImage *image = XCreateImage(_display, _visualInfo->visual,
-+        _visualInfo->depth, ZPixmap, 0, (char *)pixels, before.width,
-+        before.height, 32, before.bytesPerRow);
-+    if (!image)
-+        return _remoteFrameValid;
-+
-+    if (!_remoteFrameWindow) {
-+        int shapeMajor, shapeMinor;
-+        if (!XShapeQueryVersion(_display, &shapeMajor, &shapeMinor) ||
-+            shapeMajor < 1 || (shapeMajor == 1 && shapeMinor < 1)) {
-+            image->data = NULL;
-+            XDestroyImage(image);
-+            return _remoteFrameValid;
-+        }
-+        XSetWindowAttributes attrs = {0};
-+        attrs.background_pixmap = None;
-+        attrs.event_mask = ExposureMask;
-+        _remoteFrameWindow = XCreateWindow(_display, _window, frameX, frameY,
-+            before.width, before.height, 0, CopyFromParent, InputOutput,
-+            CopyFromParent, CWBackPixmap | CWEventMask, &attrs);
-+        /* An empty input shape lets clicks and motion reach native views. */
-+        XShapeCombineRectangles(_display, _remoteFrameWindow, ShapeInput,
-+            0, 0, NULL, 0, ShapeSet, Unsorted);
-+        [(X11Display *) [NSDisplay currentDisplay] setWindow: self forID: _remoteFrameWindow];
-+        _remoteFrameGC = XCreateGC(_display, _remoteFrameWindow, 0, NULL);
-+    }
-+    if (_remoteFrameWidth != before.width || _remoteFrameHeight != before.height) {
-+        if (_remoteFrameShm) {
-+            _remoteFrameShmDestroy(_remoteFrameShm);
-+            _remoteFrameShm = NULL;
-+            _remoteFrameShmPumping = NO;
-+            [self setRemoteFrameTimerSlow: NO];
-+        }
-+        XResizeWindow(_display, _remoteFrameWindow, before.width, before.height);
-+        _remoteFrameWidth = before.width;
-+        _remoteFrameHeight = before.height;
-+    }
-+    XMapRaised(_display, _remoteFrameWindow);
-+    typedef void *(*CreateShm)(Display *, Visual *, unsigned, unsigned, unsigned);
-+    typedef int (*PutShm)(void *, Drawable, GC, const void *, size_t);
-+    static CreateShm createShm;
-+    static PutShm putShm;
-+    static void (*destroyShm)(void *);
-+    static int (*startShm)(void *, Drawable, GC, const char *);
-+    static BOOL checkedShm;
-+    if (!checkedShm) {
-+        checkedShm = YES;
-+        const char *transportPath = getenv("DARLING_XSHM_LIBRARY");
-+        const char *shmOption = getenv("RCLOL_XSHM");
-+        void *transport = (shmOption && shmOption[0] == '0') ? NULL :
-+            dlopen(transportPath ? transportPath : "/usr/lib/native/libDarlingXShm.dylib",
-+                RTLD_NOW | RTLD_LOCAL);
-+        void *(*getCreate)(void) = transport ? dlsym(transport, "DarlingXShmGetCreate") : NULL;
-+        void *(*getPut)(void) = transport ? dlsym(transport, "DarlingXShmGetPut") : NULL;
-+        void *(*getDestroy)(void) = transport ? dlsym(transport, "DarlingXShmGetDestroy") : NULL;
-+        void *(*getStart)(void) = transport ? dlsym(transport, "DarlingXShmGetStart") : NULL;
-+        if (getCreate && getPut && getDestroy) {
-+            createShm = (CreateShm)getCreate();
-+            putShm = (PutShm)getPut();
-+            destroyShm = (void (*)(void *))getDestroy();
-+            if (getStart) startShm = (int (*)(void *, Drawable, GC, const char *))getStart();
-+        }
-+    }
-+    if (!_remoteFrameShm && createShm && putShm && destroyShm) {
-+        /* The independent connection must see this client's child creation
-+         * before issuing its first upload or creating its private GC. */
-+        XSync(_display, False);
-+        _remoteFrameShm = createShm(_display, _visualInfo->visual,
-+            _visualInfo->depth, before.width, before.height);
-+        _remoteFrameShmDestroy = destroyShm;
-+        _remoteFrameShmPut = putShm;
-+        _remoteFrameShmStart = startShm;
-+        if (getenv("RCLOL_XSHM_TRACE")) {
-+            extern int __simple_printf(const char *, ...);
-+            __simple_printf("REMOTE_XSHM width=%u height=%u active=%d\n",
-+                before.width, before.height, _remoteFrameShm != NULL);
-+        }
-+    }
-+    if (!_remoteFrameShm || !putShm(_remoteFrameShm, _remoteFrameWindow,
-+            _remoteFrameGC, pixels, before.bytesPerRow)) {
-+        XPutImage(_display, _remoteFrameWindow, _remoteFrameGC, image, 0, 0, 0, 0,
-+            before.width, before.height);
-+        XFlush(_display);
-+    }
-+    if (_remoteFrameShm && startShm && !_remoteFrameShmPumping) {
-+        _remoteFrameShmPumping = startShm(_remoteFrameShm, _remoteFrameWindow, _remoteFrameGC, path);
-+        if (_remoteFrameShmPumping) [self setRemoteFrameTimerSlow: YES];
-+    }
-+    _remoteFrameSequence = before.sequence;
-+    snprintf(_remoteFramePath, sizeof(_remoteFramePath), "%s", path);
-+    _remoteFrameValid = YES;
-+    image->data = NULL; /* pixels is reused by the next frame */
-+    XDestroyImage(image);
-+    if (tlog) { fputc('b', tlog); fflush(tlog); }
-+    return YES;
-+}
-+
-+- (BOOL) handleRemoteFrameExpose: (Window) window {
-+    if (!window || window != _remoteFrameWindow)
-+        return NO;
-+    _remoteFrameValid = NO;
-+    [self presentRemoteCAFrame: nil];
-+    return YES;
-+}
-+
- - (Window) windowHandle {
-     return _window;
- }
-@@ -470,14 +983,32 @@ static NSData *makeWindowIcon() {
-     const char *text = [title cString];
-     XStringListToTextProperty((char **) &text, 1, &prop);
-     XSetWMName(_display, _window, &prop);
-+    if (title && [title rangeOfString:@"(TM) Client" options:NSCaseInsensitiveSearch].location != NSNotFound) {
-+        [(X11Display *)[NSDisplay currentDisplay] updateMouseConfinementForWindow:self];
-+    }
- }
- 
- - (void) setFrame: (O2Rect) frame {
--    frame = [self transformFrame: frame];
-+    frame = [(X11Display *) [NSDisplay currentDisplay] rootRectForFrame: frame];
-+    BOOL fullscreen = [self wantsFullscreenWithStyleMask:_styleMask rootFrame:frame];
-+    if (!fullscreen) [self requestFullscreen:NO force:NO];
-     XMoveResizeWindow(_display, _window, frame.origin.x, frame.origin.y,
-                       frame.size.width, frame.size.height);
-     [self invalidateContextWithNewSize: frame.size];
-     _frame = frame;
-+    // Nonresizable windows can be created at 1x1 and enlarged before display.
-+    // Refresh the constraints so a managing compositor sees the current size.
-+    if (!(_styleMask & NSWindowStyleMaskResizable)) {
-+        if (!X11IsLeagueGameWindow(_display, _window, _delegate)) {
-+            XSizeHints hints = {0};
-+            hints.flags = PMinSize | PMaxSize;
-+            hints.min_width = hints.max_width = frame.size.width;
-+            hints.min_height = hints.max_height = frame.size.height;
-+            XSetWMSizeHints(_display, _window, &hints, XA_WM_NORMAL_HINTS);
-+        }
-+    }
-+    if (fullscreen) [self requestFullscreen:YES force:NO];
-+    [(X11Display *)[NSDisplay currentDisplay] updateMouseConfinementForWindow:self];
- }
- 
- - (void) setHasShadow: (BOOL) value {
-@@ -488,6 +1019,25 @@ static NSData *makeWindowIcon() {
-     _level = value;
- }
- 
-+/* NSApplication's attention timer calls this for requestUserAttention:. The
-+ * CGWindow base class raises an abstract-invocation exception, which aborted
-+ * the whole LeagueClientUx process. Ask the window manager to mark the window
-+ * as demanding attention instead. */
-+- (void) flashWindow {
-+    XClientMessageEvent event = {0};
-+    event.type = ClientMessage;
-+    event.window = _window;
-+    event.message_type = XInternAtom(_display, "_NET_WM_STATE", False);
-+    event.format = 32;
-+    event.data.l[0] = 1; /* _NET_WM_STATE_ADD */
-+    event.data.l[1] = (long) XInternAtom(_display, "_NET_WM_STATE_DEMANDS_ATTENTION", False);
-+    event.data.l[3] = 1;
-+    XSendEvent(_display, DefaultRootWindow(_display), False,
-+               SubstructureNotifyMask | SubstructureRedirectMask,
-+               (XEvent *) &event);
-+    XFlush(_display);
-+}
-+
- - (void) setOpaque: (BOOL) value {
-     _isOpaque = value;
- }
-@@ -543,6 +1093,21 @@ static NSData *makeWindowIcon() {
- - (void) makeKey {
-     [self ensureMapped];
-     XRaiseWindow(_display, _window);
-+    /* darling-lol: League's game window is managed (not override-redirect), so keyboard focus is
-+     * the WM's to give. Ask for activation once when the game makes it key; the WM's focus-stealing
-+     * policy still applies, unlike a direct XSetInputFocus. */
-+    if (X11IsLeagueGameWindow(_display, _window, _delegate)) {
-+        XEvent act = {0};
-+        act.xclient.type = ClientMessage;
-+        act.xclient.window = _window;
-+        act.xclient.message_type = XInternAtom(_display, "_NET_ACTIVE_WINDOW", False);
-+        act.xclient.format = 32;
-+        act.xclient.data.l[0] = 1; /* source: normal application */
-+        act.xclient.data.l[1] = CurrentTime;
-+        XSendEvent(_display, DefaultRootWindow(_display), False,
-+                   SubstructureRedirectMask | SubstructureNotifyMask, &act);
-+        XFlush(_display);
-+    }
- }
- 
- - (void) makeMain {
-@@ -559,7 +1124,29 @@ static NSData *makeWindowIcon() {
-     XRaiseWindow(_display, _window);
- }
- 
-+/* darling-lol: AppKit asks every window whether it is miniaturized on every event poll (NSWindow
-+ * _makeSureIsOnAScreen), and each answer was a synchronous X round trip (XGetWindowProperty): about 13 blocking waits
-+ * per game frame. Reuse the answer for 100 ms per window. */
-+#include <mach/mach_time.h>
-+#define RCLOL_MINI_SLOTS 32
-+static struct { Window window; uint64_t stamp; BOOL value; } rclolMini[RCLOL_MINI_SLOTS];
-+
- - (BOOL) isMiniaturized {
-+    static mach_timebase_info_data_t tb;
-+    if (tb.denom == 0) mach_timebase_info(&tb);
-+    uint64_t now = mach_absolute_time();
-+    unsigned slot = (unsigned) (_window % RCLOL_MINI_SLOTS);
-+    if (rclolMini[slot].window == _window && rclolMini[slot].stamp != 0 &&
-+        (now - rclolMini[slot].stamp) * tb.numer / tb.denom < 100000000ULL)
-+        return rclolMini[slot].value;
-+    BOOL value = [self rclolQueryMiniaturized];
-+    rclolMini[slot].window = _window;
-+    rclolMini[slot].value = value;
-+    rclolMini[slot].stamp = now;
-+    return value;
-+}
-+
-+- (BOOL) rclolQueryMiniaturized {
-     Atom wmState = XInternAtom(_display, "_NET_WM_STATE", FALSE);
-     Atom hiddenState = XInternAtom(_display, "_NET_WM_STATE_HIDDEN", FALSE);
- 
-@@ -615,6 +1202,12 @@ static NSData *makeWindowIcon() {
- }
- 
- - (void) openGLFlushBuffer {
-+    /* A remote compositor surface owns this drawable while it is present.
-+     * Swapping the local Onyx surface would erase it until the next timer
-+     * tick. Keep local presentation for windows without a usable remote frame. */
-+    if ([self presentRemoteCAFrame: nil])
-+        return;
-+
-     CGLError error;
- 
-     CGLContextObj prevContext = CGLGetCurrentContext();
-@@ -652,7 +1245,7 @@ static NSData *makeWindowIcon() {
- }
- 
- - (O2Rect) frame {
--    return [self transformFrame: _frame];
-+    return [(X11Display *) [NSDisplay currentDisplay] frameForRootRect: _frame];
- }
- 
- static int ignoreBadWindow(Display *display, XErrorEvent *errorEvent) {
-@@ -666,6 +1259,7 @@ static int ignoreBadWindow(Display *display, XErrorEvent *errorEvent) {
- }
- 
- - (void) frameChanged {
-+    _remoteFrameTargetRefresh = 0;
-     XErrorHandler previousHandler = XSetErrorHandler(ignoreBadWindow);
-     @try {
-         Window root, parent;
-@@ -710,14 +1304,6 @@ static int ignoreBadWindow(Display *display, XErrorEvent *errorEvent) {
-     [_deviceDictionary addEntriesFromDictionary: entries];
- }
- 
--- (O2Rect) transformFrame: (O2Rect) frame {
--    return NSMakeRect(frame.origin.x,
--                      DisplayHeight(_display, DefaultScreen(_display)) -
--                              frame.origin.y - frame.size.height,
--                      fmax(frame.size.width, 1.0),
--                      fmax(frame.size.height, 1.0));
--}
--
- - (NSPoint) transformPoint: (NSPoint) pos; {
-     return NSMakePoint(pos.x, _frame.size.height - pos.y);
- }
 diff --git a/AppKit/include/AppKit/NSAccessibilityConstants.h b/AppKit/include/AppKit/NSAccessibilityConstants.h
 index 282312de..03c75b2b 100644
 --- a/AppKit/include/AppKit/NSAccessibilityConstants.h
@@ -10378,3 +9484,1070 @@ index 00000000..19cd9ea9
 +- (instancetype) init;
 +
 +@end
+diff --git a/AppKit/NSSavePanel.subproj/NSSavePanel.m b/AppKit/NSSavePanel.subproj/NSSavePanel.m
+index 50c3d59e..cbc183f6 100644
+--- a/AppKit/NSSavePanel.subproj/NSSavePanel.m
++++ b/AppKit/NSSavePanel.subproj/NSSavePanel.m
+@@ -124,8 +124,24 @@ static NSSavePanel *_newPanel = nil;
+     [NSApp stopModalWithCode: NSCancelButton];
+ }
+ 
++- (void) beginSheetModalForWindow: (NSWindow *) window
++                completionHandler: (void (^)(NSModalResponse result)) handler
++{
++    /* Cocotron has no sheets: run the panel modally, as -runModal already does
++       for the legacy runModalForDirectory: entry points, then hand the response
++       to the completion handler. Chromium's Cocoa file dialog calls this
++       selector; while it was missing the call raised
++       NSInvalidArgumentException and aborted the client (SIGABRT) when the game
++       install folder picker opened. */
++    NSModalResponse result = [self runModal];
++
++    if (handler != nil) {
++        handler(result);
++    }
++}
++
+ - (void) beginWithCompletionHandler: (void (^)(NSModalResponse result)) handler {
+-    NSUnimplementedMethod();
++    [self beginSheetModalForWindow: nil completionHandler: handler];
+ }
+ 
+ - (NSInteger) runModalForDirectory: (NSString *) directory
+@@ -260,6 +276,26 @@ static NSSavePanel *_newPanel = nil;
+     NSUnimplementedMethod();
+ }
+ 
++/* Modern panel setters Chromium's Cocoa file dialog calls while configuring an
++   NSOpenPanel. The nib panel has no tag field, hidden-extension control or name
++   field label, so these accept and ignore the values; without them the calls
++   raised unrecognized-selector exceptions and aborted the client. */
++- (void) setShowsTagField: (BOOL) value {
++    (void) value;
++}
++
++- (void) setCanSelectHiddenExtension: (BOOL) value {
++    (void) value;
++}
++
++- (void) setExtensionHidden: (BOOL) value {
++    (void) value;
++}
++
++- (void) setNameFieldLabel: (NSString *) label {
++    (void) label;
++}
++
+ - (void) beginSheetForDirectory: (NSString *) path
+                            file: (NSString *) name
+                  modalForWindow: (NSWindow *) docWindow
+diff --git a/AppKit/X11.backend/X11Window.h b/AppKit/X11.backend/X11Window.h
+index bfe3839a..8e764268 100644
+--- a/AppKit/X11.backend/X11Window.h
++++ b/AppKit/X11.backend/X11Window.h
+@@ -26,7 +26,7 @@
+ #import <X11/Xresource.h>
+ #import <X11/Xlocale.h>
+ 
+-@class X11Display, CAWindowOpenGLContext, NSWindow, O2Context;
++@class X11Display, CAWindowOpenGLContext, NSWindow, O2Context, NSTimer;
+ 
+ @interface X11Window : CGWindow {
+     int _level; // TODO: care about this value
+@@ -47,8 +47,31 @@
+     BOOL _mapped;
+     CGPoint _lastMotionPos;
+     BOOL _isModal;
++    BOOL _overrideRedirect;
++    BOOL _fullscreenRequested;
+     BOOL _isOpaque;
+     BOOL _hasShadow;
++    BOOL _isPanel;
++    NSTimer *_remoteFrameTimer;
++    Window _remoteFrameWindow;
++    GC _remoteFrameGC;
++    unsigned int _remoteFrameSequence, _remoteFrameWidth, _remoteFrameHeight;
++    BOOL _remoteFrameValid;
++    char _remoteFramePath[128];
++    XWindowAttributes _remoteFrameTargets[17];
++    unsigned _remoteFrameTargetCount;
++    double _remoteFrameTargetRefresh;
++    void *_remoteFrameMapping;
++    size_t _remoteFrameMappingSize;
++    char _remoteFrameMappingPath[128];
++    double _remoteFrameSelectionRefresh;
++    void *_remoteFrameShm;
++    void (*_remoteFrameShmDestroy)(void *);
++    int (*_remoteFrameShmPut)(void *, Drawable, GC, const void *, size_t);
++    int (*_remoteFrameShmStart)(void *, Drawable, GC, const char *);
++    BOOL _remoteFrameShmPumping;
++    BOOL _remoteFrameSoftwarePublisher;
++    BOOL _remoteFrameTimerSlow;
+ 
+ @public
+     XIC _xic;
+@@ -60,9 +83,9 @@
+ - (Visual *) visual;
+ - (Drawable) drawable;
+ - (NSPoint) transformPoint: (NSPoint) pos;
+-- (O2Rect) transformFrame: (O2Rect) frame;
+ 
+ - (Window) windowHandle;
++- (BOOL) handleRemoteFrameExpose: (Window) window;
+ 
+ - (void) frameChanged;
+ - (void) setLastKnownCursorPosition: (CGPoint) point;
+diff --git a/AppKit/X11.backend/X11Window.m b/AppKit/X11.backend/X11Window.m
+index f4925b66..ddbacd28 100644
+--- a/AppKit/X11.backend/X11Window.m
++++ b/AppKit/X11.backend/X11Window.m
+@@ -23,6 +23,7 @@
+ #import <AppKit/NSPopUpWindow.h>
+ #import <AppKit/NSRaise.h>
+ #import <AppKit/NSWindow.h>
++#import <AppKit/NSScreen.h>
+ #import <Foundation/NSBundle.h>
+ #import <Foundation/NSException.h>
+ #import <Foundation/NSMutableData.h>
+@@ -38,6 +39,34 @@
+ #import "X11Window.h"
+ #import <X11/Xatom.h>
+ #import <X11/Xutil.h>
++#import <X11/extensions/shape.h>
++#include <fcntl.h>
++#include <stdint.h>
++#include <stdlib.h>
++#include <unistd.h>
++#include <dirent.h>
++#include <string.h>
++#include <sys/stat.h>
++#include <sys/mman.h>
++#include <dlfcn.h>
++#include <sys/signal.h>
++#include <errno.h>
++
++#define DARLING_CA_FRAME_MAGIC 0x43414652u
++#define DARLING_CA_FRAME_BUFFERED_MAGIC 0x43414632u
++static size_t framePayloadOffset(uint32_t magic, uint32_t format) {
++    return magic == DARLING_CA_FRAME_BUFFERED_MAGIC && (format & 0x40000000u)
++        ? 32u * 1024u * 1024u : 0;
++}
++typedef struct {
++    uint32_t magic;
++    volatile uint32_t sequence;
++    uint32_t width;
++    uint32_t height;
++    uint32_t bytesPerRow;
++    uint32_t pixelFormat;
++    uint64_t dataSize;
++} DarlingCARemoteFrame;
+ 
+ @implementation X11Window
+ 
+@@ -158,8 +187,9 @@ static NSData *makeWindowIcon() {
+     X11Display* x11disp = (X11Display *) [NSDisplay currentDisplay];
+     _display = [x11disp display];
+ 
+-    _frame = [self transformFrame: [delegate frame]];
++    _frame = [x11disp rootRectForFrame: [delegate frame]];
+     BOOL isPanel = [delegate isKindOfClass: [NSPanel class]];
++    _isPanel = isPanel;
+     if (isPanel && _styleMask & NSDocModalWindowMask)
+         _styleMask = NSBorderlessWindowMask;
+     // TODO: get rid of these glX calls
+@@ -177,7 +207,27 @@ static NSData *makeWindowIcon() {
+ 
+     int screen = DefaultScreen(_display);
+ 
+-    if ((_visualInfo = glXChooseVisual(_display, screen, att)) == NULL) {
++    /* darling-lol: an X window can only be given a CGL/EGL window surface when
++     * its visual is one of the window-capable EGL configs' EGL_NATIVE_VISUAL_ID.
++     * On NVIDIA/XWayland the GLX and EGL visual sets are disjoint, so a window
++     * created from glXChooseVisual (0x2d1) made every CGLGetWindow fail with
++     * EGL_BAD_CONFIG: no GL/Metal content, and the game's layer compositor never
++     * ran, starving its Metal drawables into a black window. Ask CGL for the
++     * visual EGL accepts and keep glXChooseVisual as the fallback. */
++    unsigned int eglVisual = 0;
++    if (CGLGetWindowVisual(&eglVisual) == kCGLNoError && eglVisual != 0) {
++        XVisualInfo wanted;
++        int matched = 0;
++        memset(&wanted, 0, sizeof(wanted));
++        wanted.visualid = (VisualID) eglVisual;
++        _visualInfo = XGetVisualInfo(_display, VisualIDMask, &wanted, &matched);
++        if (_visualInfo != NULL && matched < 1) {
++            XFree(_visualInfo);
++            _visualInfo = NULL;
++        }
++    }
++
++    if (_visualInfo == NULL && (_visualInfo = glXChooseVisual(_display, screen, att)) == NULL) {
+         NSLog(@"glXChooseVisual failed at %s %d", __FILE__, __LINE__);
+     }
+ 
+@@ -193,8 +243,16 @@ static NSData *makeWindowIcon() {
+ 
+     XSetWindowAttributes xattr;
+     unsigned long xattr_mask;
+-    xattr.override_redirect =
+-            _styleMask == NSBorderlessWindowMask ? True : False;
++    BOOL isGame = X11IsLeagueGameWindow(_display, None, delegate);
++
++    // A borderless game is still a focusable application window. Leaving it
++    // override-redirect makes XWayland bypass compositor keyboard activation.
++    // Menus and nonactivating popups keep their unmanaged behavior.
++    xattr.override_redirect = !isGame && _styleMask == NSBorderlessWindowMask &&
++            ([delegate isKindOfClass:[NSMenuWindow class]] ||
++             [delegate isKindOfClass:[NSPopUpWindow class]] ||
++             ![delegate canBecomeKeyWindow]) ? True : False;
++    _overrideRedirect = xattr.override_redirect;
+     xattr_mask = CWOverrideRedirect | CWColormap;
+     xattr.colormap = cmap;
+ 
+@@ -206,6 +264,12 @@ static NSData *makeWindowIcon() {
+             (_visualInfo == NULL) ? CopyFromParent : _visualInfo->visual,
+             xattr_mask, &xattr);
+ 
++    /* Keep Cocoa's process identifier available to cross-process activation. */
++    unsigned long windowPID = (unsigned long)getpid();
++    XChangeProperty(_display, _window, XInternAtom(_display, "_NET_WM_PID", False),
++                    XA_CARDINAL, 32, PropModeReplace,
++                    (unsigned char *)&windowPID, 1);
++
+     [self syncDelegateProperties];
+ 
+     Atom atm = XInternAtom(_display, "WM_DELETE_WINDOW", False);
+@@ -217,6 +281,15 @@ static NSData *makeWindowIcon() {
+                             .res_class = (char *) name};
+     XSetClassHint(_display, _window, &classHint);
+ 
++    if (isGame && !(_styleMask & NSTitledWindowMask)) {
++        /* darling-lol: never let the compositor scan out this parent window
++         * directly (bypass=2): Metal/OpenGL draw into a child window, so direct
++         * scanout shows black. EWMH fullscreen is requested in setStyleMask. */
++        unsigned long bypass = 2;
++        XChangeProperty(_display, _window, XInternAtom(_display, "_NET_WM_BYPASS_COMPOSITOR", False),
++                        XA_CARDINAL, 32, PropModeReplace, (unsigned char *)&bypass, 1);
++    }
++
+     XSetWindowBackgroundPixmap(_display, _window, None);
+ 
+     _isModal = [delegate isSheet] || [NSApp modalWindow] == delegate;
+@@ -266,6 +339,13 @@ static NSData *makeWindowIcon() {
+ 
+     [self setWindowIcon];
+ 
++    /* Chromium windows consume cross-process CA frames. League's native Metal window owns its
++     * drawable; a same-size client surface must never be raised above that drawable. */
++    if (!isGame)
++        _remoteFrameTimer = [[NSTimer scheduledTimerWithTimeInterval: 1.0 / 60.0
++            target: self selector: @selector(presentRemoteCAFrame:)
++            userInfo: nil repeats: YES] retain];
++
+     return self;
+ }
+ 
+@@ -279,24 +359,30 @@ static NSData *makeWindowIcon() {
+     return _styleMask;
+ }
+ 
+-- (void) setStyleMaskInternal: (NSUInteger) mask force: (BOOL) force {
+-    if (force || (mask & NSWindowStyleMaskResizable) !=
+-                         (_styleMask & NSWindowStyleMaskResizable)) {
+-        XSizeHints *sh = XAllocSizeHints();
+-        if (mask & NSWindowStyleMaskResizable) {
+-            // Make resizable
+-            sh->flags = 0;
+-        } else {
+-            // Make non-resizable
+-            sh->flags = PMinSize | PMaxSize;
+-            sh->min_width = sh->max_width = _frame.size.width;
+-            sh->min_height = sh->max_height = _frame.size.height;
+-        }
+-
+-        XSetWMSizeHints(_display, _window, sh, XA_WM_NORMAL_HINTS);
+-        XFree(sh);
++/* A borderless application covering a monitor needs EWMH fullscreen so the
++ * compositor places it above desktop panels. Compare full monitor bounds,
++ * never the work area, and leave unmanaged menus/popups alone. */
++- (BOOL) wantsFullscreenWithStyleMask: (NSUInteger) mask rootFrame: (O2Rect) frame {
++    if (_overrideRedirect || [_delegate isKindOfClass:[NSPanel class]] ||
++        [_delegate isKindOfClass:[NSMenuWindow class]] || [_delegate isKindOfClass:[NSPopUpWindow class]] ||
++        [_delegate isKindOfClass:NSClassFromString(@"NSToolTipWindow")]) return NO;
++    if (mask & NSWindowStyleMaskFullScreen) return YES;
++    if (mask & NSTitledWindowMask) return NO;
++    X11Display *display = (X11Display *) [NSDisplay currentDisplay];
++    for (NSScreen *screen in [display screens]) {
++        if (!NSIsEmptyRect([screen frame]) &&
++            NSEqualRects([display rootRectForFrame: [screen frame]], frame))
++            return YES;
+     }
++    return NO;
++}
+ 
++- (void) requestFullscreen: (BOOL) fullscreen force: (BOOL) force {
++    if (fullscreen) {
++        unsigned long bypass = 2;
++        XChangeProperty(_display, _window, XInternAtom(_display,"_NET_WM_BYPASS_COMPOSITOR",False),
++                        XA_CARDINAL,32,PropModeReplace,(unsigned char *)&bypass,1);
++    }
+     if (!_mapped) {
+         long states[2];
+         int states_cnt = 0;
+@@ -304,7 +390,7 @@ static NSData *makeWindowIcon() {
+             states[states_cnt++] =
+                     (long) XInternAtom(_display, "_NET_WM_STATE_MODAL", False);
+         }
+-        if (mask & NSWindowStyleMaskFullScreen) {
++        if (fullscreen) {
+             states[states_cnt++] = (long) XInternAtom(
+                     _display, "_NET_WM_STATE_FULLSCREEN", False);
+         }
+@@ -312,14 +398,13 @@ static NSData *makeWindowIcon() {
+                         XInternAtom(_display, "_NET_WM_STATE", False), XA_ATOM,
+                         32, PropModeReplace, (const unsigned char *) states,
+                         states_cnt);
+-    } else if (force || ((mask & NSWindowStyleMaskFullScreen) !=
+-                         (_styleMask & NSWindowStyleMaskFullScreen))) {
++    } else if (force || fullscreen != _fullscreenRequested) {
+         XClientMessageEvent event = {0};
+         event.type = ClientMessage;
+         event.window = _window;
+         event.message_type = XInternAtom(_display, "_NET_WM_STATE", False);
+         event.format = 32;
+-        event.data.l[0] = (mask & NSWindowStyleMaskFullScreen) ? 1 : 2;
++        event.data.l[0] = fullscreen ? 1 : 0; /* EWMH ADD / REMOVE, not TOGGLE */
+         event.data.l[1] =
+                 (long) XInternAtom(_display, "_NET_WM_STATE_FULLSCREEN", False);
+         event.data.l[3] = 1;
+@@ -327,6 +412,35 @@ static NSData *makeWindowIcon() {
+                    SubstructureNotifyMask | SubstructureRedirectMask,
+                    (XEvent *) &event);
+     }
++    _fullscreenRequested = fullscreen;
++    XFlush(_display);
++}
++
++- (void) setStyleMaskInternal: (NSUInteger) mask force: (BOOL) force {
++    if (force || (mask & NSWindowStyleMaskResizable) !=
++                         (_styleMask & NSWindowStyleMaskResizable)) {
++        XSizeHints *sh = XAllocSizeHints();
++        if (mask & NSWindowStyleMaskResizable) {
++            // Make resizable
++            sh->flags = 0;
++        } else {
++            if (X11IsLeagueGameWindow(_display, _window, _delegate)) {
++                // A fixed-size window cannot be made EWMH fullscreen by Mutter,
++                // and a stale minimum would block switching to a smaller mode.
++                sh->flags = 0;
++            } else {
++                // Make non-resizable
++                sh->flags = PMinSize | PMaxSize;
++                sh->min_width = sh->max_width = _frame.size.width;
++                sh->min_height = sh->max_height = _frame.size.height;
++            }
++        }
++
++        XSetWMSizeHints(_display, _window, sh, XA_WM_NORMAL_HINTS);
++        XFree(sh);
++    }
++
++    [self requestFullscreen:[self wantsFullscreenWithStyleMask:mask rootFrame:_frame] force:force];
+ }
+ 
+ - (void) setStyleMask: (NSUInteger) mask {
+@@ -338,7 +452,6 @@ static NSData *makeWindowIcon() {
+ }
+ 
+ + (void) removeDecorationForWindow: (Window) w onDisplay: (Display *) dpy {
+-    return;
+     struct {
+         unsigned long flags;
+         unsigned long functions;
+@@ -358,6 +471,7 @@ static NSData *makeWindowIcon() {
+     if (!_mapped) {
+         XMapWindow(_display, _window);
+         _mapped = YES;
++        _remoteFrameTargetRefresh = 0;
+     }
+ }
+ 
+@@ -377,15 +491,27 @@ static NSData *makeWindowIcon() {
+ - (void) syncDelegateProperties {
+     long mask = KeyPressMask | KeyReleaseMask | ExposureMask |
+                 StructureNotifyMask | EnterWindowMask | LeaveWindowMask |
+-                ButtonPressMask | ButtonReleaseMask | ButtonMotionMask |
+-                VisibilityChangeMask | FocusChangeMask |
++                ButtonPressMask | ButtonReleaseMask | ButtonMotionMask | PointerMotionMask |
++                VisibilityChangeMask | FocusChangeMask | PropertyChangeMask |
+                 SubstructureRedirectMask;
+ 
+-    if ([_delegate acceptsMouseMovedEvents]) {
+-        mask |= PointerMotionMask;
+-    }
++    /* Motion also restores a cursor hidden while typing. App-level motion
++     * delivery is still filtered by acceptsMouseMovedEvents in X11Display. */
+     XSelectInput(_display, _window, mask);
+ 
++    /* Mouse-transparent windows must not steal crossing events from the
++     * view below them. Filtering dispatched events leaves X11 hit testing
++     * unchanged and can repeatedly hide/recreate tooltip windows. */
++    if ([_delegate respondsToSelector: @selector(ignoresMouseEvents)]) {
++        if ([_delegate ignoresMouseEvents])
++            XShapeCombineRectangles(_display, _window, ShapeInput,
++                                    0, 0, NULL, 0, ShapeSet, Unsorted);
++        else
++            XShapeCombineMask(_display, _window, ShapeInput,
++                              0, 0, None, ShapeSet);
++        XFlush(_display);
++    }
++
+     // TODO: background color
+ }
+ 
+@@ -393,6 +519,28 @@ static NSData *makeWindowIcon() {
+     // This is essentially dealloc; we release our contexts
+     // and windows, but unlike dealloc, this method can be called
+     // several times, so set everything to nil/NULL/0.
++    [_remoteFrameTimer invalidate];
++    [_remoteFrameTimer release];
++    _remoteFrameTimer = nil;
++    if (_remoteFrameShm) {
++        _remoteFrameShmDestroy(_remoteFrameShm);
++        _remoteFrameShm = NULL;
++        _remoteFrameShmPumping = NO;
++    }
++    if (_remoteFrameMapping) {
++        munmap(_remoteFrameMapping, _remoteFrameMappingSize);
++        _remoteFrameMapping = NULL;
++        _remoteFrameMappingSize = 0;
++    }
++
++    if (_remoteFrameWindow) {
++        [(X11Display *) [NSDisplay currentDisplay] setWindow: nil forID: _remoteFrameWindow];
++        if (_remoteFrameGC) XFreeGC(_display, _remoteFrameGC);
++        XDestroyWindow(_display, _remoteFrameWindow);
++        _remoteFrameWindow = 0;
++        _remoteFrameGC = NULL;
++        _remoteFrameValid = NO;
++    }
+     [_context release];
+     _context = nil;
+ 
+@@ -421,6 +569,392 @@ static NSData *makeWindowIcon() {
+     }
+ }
+ 
++- (void) setRemoteFrameTimerSlow: (BOOL) slow {
++    if (_remoteFrameTimerSlow == slow) return;
++    _remoteFrameTimerSlow = slow;
++    [_remoteFrameTimer invalidate];
++    [_remoteFrameTimer release];
++    _remoteFrameTimer = [[NSTimer scheduledTimerWithTimeInterval: slow ? 0.25 : 1.0 / 60.0
++        target: self selector: @selector(presentRemoteCAFrame:)
++        userInfo: nil repeats: YES] retain];
++}
++
++- (BOOL) presentRemoteCAFrame: (NSTimer *) timer {
++    static unsigned char *pixels;
++    static size_t pixelCapacity;
++    /* Slots are selected by dimensions, not by window ownership. A fullscreen client slot can
++     * match the game and create a black presentation child above Metal's X11SubWindow. Keep
++     * the native game renderer authoritative, including calls from openGLFlushBuffer/expose. */
++    if (X11IsLeagueGameWindow(_display, _window, _delegate)) return NO;
++    if (!_mapped) return NO;
++    double now = CFAbsoluteTimeGetCurrent();
++    /* X geometry queries are synchronous round trips. Cache stable targets
++     * across animation ticks, invalidating on native resize/mapping changes. */
++    if (!_remoteFrameTargetCount || now >= _remoteFrameTargetRefresh) {
++        XWindowAttributes attributes;
++        if (!XGetWindowAttributes(_display, _window, &attributes) ||
++            attributes.map_state != IsViewable)
++            return NO;
++        _remoteFrameTargetCount = 1;
++        _remoteFrameTargets[0] = attributes;
++        Window root, parent, *children = NULL;
++        unsigned childCount = 0;
++        if (XQueryTree(_display, _window, &root, &parent, &children, &childCount)) {
++            for (unsigned i = 0; i < childCount && _remoteFrameTargetCount < 17; ++i)
++                if (children[i] != _remoteFrameWindow &&
++                    XGetWindowAttributes(_display, children[i],
++                        &_remoteFrameTargets[_remoteFrameTargetCount]))
++                    ++_remoteFrameTargetCount;
++        }
++        if (children) XFree(children);
++        _remoteFrameTargetRefresh = now + 1.0;
++    }
++    XWindowAttributes *frameTargets = _remoteFrameTargets;
++    unsigned frameTargetCount = _remoteFrameTargetCount;
++    DarlingCARemoteFrame before, after;
++    if (_remoteFrameValid && _remoteFrameMapping &&
++        (((DarlingCARemoteFrame *)_remoteFrameMapping)->sequence & 1)) {
++        XRaiseWindow(_display, _remoteFrameWindow);
++        XFlush(_display);
++        return YES;
++    }
++    /* darling-lol M58c diagnostic (opt-in via M58_PRES_TRACE): one character
++     * per event appended to /dev/shm/m58c-present-<pid> so the consumer's
++     * behavior can be observed from the host without guest logging noise.
++     * t=timer fired, s=no candidate slot, S=slot chosen, s=same sequence,
++     * b=blit performed, v=header validation failed. */
++    int (*_tputc)(int) = NULL;
++    (void) _tputc;
++    static FILE *tlog;
++    if (getenv("M58_PRES_TRACE")) {
++        if (!tlog) {
++            char tpath[128];
++            snprintf(tpath, sizeof(tpath),
++                "/dev/shm/m58c-present-%d", (int) getpid());
++            tlog = fopen(tpath, "a");
++        }
++        if (tlog) {
++            fputc('t', tlog);
++            fflush(tlog);
++        }
++    }
++    /* darling-lol M58c: the publisher side now writes one slot file per
++     * process (/dev/shm/darling-ca-frame-<uid>-<pid>) because concurrent
++     * publishers corrupt a shared slot's seqlock. Several processes publish
++     * same-size surfaces (measured: the browser's own surface is all black
++     * while the GPU's compositor output carries the real frame), so scan
++     * every publisher's slot and display the most recently updated one that
++     * actually contains pixels; an all-black frame is only used when nothing
++     * else is available. */
++    char path[128], bestPath[128], bestBlackPath[128];
++    /* A window no publisher has a slot for (a Metal game window never gets one) used to rescan /dev/shm on every
++     * 60 Hz tick: opendir, readdir and stat/open/pread/close per slot file on the main thread. */
++    if (!_remoteFrameMapping && now < _remoteFrameSelectionRefresh)
++        return _remoteFrameValid;
++    if (_remoteFrameMapping && now < _remoteFrameSelectionRefresh) {
++        snprintf(path, sizeof(path), "%s", _remoteFrameMappingPath);
++        goto selectedFrame;
++    }
++    _remoteFrameSelectionRefresh = now + 0.25;
++    bestPath[0] = bestBlackPath[0] = '\0';
++    uint64_t bestMtime = 0, bestBlackMtime = 0;
++    BOOL bestSoftware = NO;
++
++    char prefix[32];
++    snprintf(prefix, sizeof(prefix), "darling-ca-frame-%u-", getuid());
++    size_t prefixLen = strlen(prefix);
++    DIR *dir = opendir("/dev/shm");
++    if (dir) {
++        struct dirent *ent;
++        while ((ent = readdir(dir)) != NULL) {
++            if (strncmp(ent->d_name, prefix, prefixLen) != 0)
++                continue;
++            char candidate[128];
++            snprintf(candidate, sizeof(candidate), "/dev/shm/%s",
++                ent->d_name);
++            struct stat st;
++            if (stat(candidate, &st) != 0)
++                continue;
++            uint64_t updateTime = (uint64_t)st.st_mtimespec.tv_sec * 1000000000u +
++                                  st.st_mtimespec.tv_nsec;
++            DarlingCARemoteFrame head = {0};
++            int cfd = open(candidate, O_RDONLY);
++            if (cfd < 0)
++                continue;
++            BOOL ok = (pread(cfd, &head, sizeof(head), 0) == sizeof(head) &&
++                (head.magic == DARLING_CA_FRAME_MAGIC || head.magic == DARLING_CA_FRAME_BUFFERED_MAGIC) &&
++                !(head.sequence & 1) &&
++                head.width && head.height &&
++                head.bytesPerRow >= head.width * 4 &&
++                head.dataSize == (uint64_t)head.bytesPerRow * head.height &&
++                head.dataSize <= 64u * 1024u * 1024u);
++            close(cfd);
++            BOOL matchesWindow = NO;
++            for (unsigned i = 0; i < frameTargetCount; ++i)
++                if (head.width == (unsigned)frameTargets[i].width &&
++                    head.height == (unsigned)frameTargets[i].height)
++                    matchesWindow = YES;
++            if (!ok || !matchesWindow)
++                continue;
++
++            /* Peek the top rows to distinguish a rendered frame from an
++             * empty (all-zero) surface of the same size. */
++            BOOL hasPixels = NO;
++            size_t peekRows = head.height < 40 ? (size_t) head.height : 40;
++            size_t peekLen = peekRows * head.bytesPerRow;
++            unsigned char peek[40 * 4096];
++            if (peekLen > sizeof(peek))
++                peekLen = sizeof(peek);
++            int pfd = open(candidate, O_RDONLY);
++            if (pfd >= 0) {
++                if (pread(pfd, peek, peekLen, sizeof(head) + framePayloadOffset(head.magic, head.pixelFormat)) ==
++                    (ssize_t) peekLen) {
++                    for (size_t i = 0; i + 3 < peekLen; i += 4) {
++                        if (peek[i] | peek[i + 1] | peek[i + 2]) {
++                            hasPixels = YES;
++                            break;
++                        }
++                    }
++                }
++                close(pfd);
++            }
++
++            if (hasPixels) {
++                BOOL software = (head.pixelFormat & 0x80000000u) != 0;
++                if ((software && !bestSoftware) ||
++                    (software == bestSoftware && updateTime > bestMtime)) {
++                    bestSoftware = software;
++                    bestMtime = updateTime;
++                    snprintf(bestPath, sizeof(bestPath), "%s", candidate);
++                }
++            } else if (updateTime > bestBlackMtime) {
++                bestBlackMtime = updateTime;
++                snprintf(bestBlackPath, sizeof(bestBlackPath), "%s", candidate);
++            }
++        }
++        closedir(dir);
++    }
++
++    /* Keep a software owner across popup updates while the presented size
++     * still belongs to this window. After a real resize, retaining that owner
++     * can strand us on its popup slot even though a matching readback frame
++     * is ready from another publisher. Let normal candidate selection make
++     * that handoff when the old presentation no longer matches a target. */
++    BOOL presentationMatchesTarget = NO;
++    for (unsigned i = 0; i < frameTargetCount; ++i)
++        if (_remoteFrameWidth == (unsigned)frameTargets[i].width &&
++            _remoteFrameHeight == (unsigned)frameTargets[i].height)
++            presentationMatchesTarget = YES;
++    if (_remoteFrameSoftwarePublisher && _remoteFrameMapping && !bestSoftware &&
++        presentationMatchesTarget) {
++        const char *pidText = strrchr(_remoteFrameMappingPath, '-');
++        int publisher = pidText ? atoi(pidText + 1) : 0;
++        if (publisher > 0 && (kill(publisher, 0) == 0 || errno != ESRCH)) {
++            snprintf(path, sizeof(path), "%s", _remoteFrameMappingPath);
++            goto selectedFrame;
++        }
++    }
++    if (bestPath[0] != '\0')
++        snprintf(path, sizeof(path), "%s", bestPath);
++    else if (bestBlackPath[0] != '\0')
++        snprintf(path, sizeof(path), "%s", bestBlackPath);
++    else {
++        /* A writer's odd sequence is a temporary gap, not a hidden window.
++         * Keep the last complete frame instead of exposing local GL pixels. */
++        if (tlog) { fputc('S', tlog); }
++        if (!_remoteFrameMapping) _remoteFrameSelectionRefresh = now + 0.5;
++        return _remoteFrameValid;
++    }
++
++    if (tlog) { fputc('S', tlog); }
++
++    /* Only the presentation child owns remote pixels. GL swaps in sibling
++     * views cannot clear it, so unchanged frames need no repeated pixel copy. */
++selectedFrame:
++    if (!_remoteFrameMapping || strcmp(_remoteFrameMappingPath, path)) {
++        int fd = open(path, O_RDONLY);
++        if (fd < 0) return _remoteFrameValid;
++        struct stat st;
++        if (fstat(fd, &st) || st.st_size < sizeof(before) ||
++            st.st_size > sizeof(before) + 64u * 1024u * 1024u) {
++            close(fd); return _remoteFrameValid;
++        }
++        void *mapping = mmap(NULL, st.st_size, PROT_READ, MAP_SHARED, fd, 0);
++        close(fd);
++        if (mapping == MAP_FAILED) return _remoteFrameValid;
++        if (_remoteFrameMapping) munmap(_remoteFrameMapping, _remoteFrameMappingSize);
++        _remoteFrameMapping = mapping;
++        _remoteFrameSoftwarePublisher = NO;
++        _remoteFrameMappingSize = st.st_size;
++        snprintf(_remoteFrameMappingPath, sizeof(_remoteFrameMappingPath), "%s", path);
++    }
++    memcpy(&before, _remoteFrameMapping, sizeof(before));
++    __sync_synchronize();
++    if ((before.magic != DARLING_CA_FRAME_MAGIC && before.magic != DARLING_CA_FRAME_BUFFERED_MAGIC) || (before.sequence & 1) ||
++        !before.width || !before.height || before.bytesPerRow < before.width * 4 ||
++        before.dataSize != (uint64_t)before.bytesPerRow * before.height ||
++        framePayloadOffset(before.magic, before.pixelFormat) > _remoteFrameMappingSize - sizeof(before) ||
++        before.dataSize > _remoteFrameMappingSize - sizeof(before) - framePayloadOffset(before.magic, before.pixelFormat))
++        return _remoteFrameValid;
++    if (before.pixelFormat & 0x80000000u) _remoteFrameSoftwarePublisher = YES;
++    BOOL matchesTarget = NO;
++    for (unsigned i = 0; i < frameTargetCount; ++i)
++        if (before.width == (unsigned)frameTargets[i].width &&
++            before.height == (unsigned)frameTargets[i].height) matchesTarget = YES;
++    /* A GPU process may publish several windows into its slot. Never resize
++     * our presentation child to another window's intervening surface. */
++    if (!matchesTarget) return _remoteFrameValid;
++    int frameX = 0, frameY = 0;
++    for (unsigned i = 0; i < frameTargetCount; ++i) {
++        if (before.width == (unsigned)frameTargets[i].width &&
++            before.height == (unsigned)frameTargets[i].height) {
++            if (i) { frameX = frameTargets[i].x; frameY = frameTargets[i].y; }
++            break;
++        }
++    }
++    if (_remoteFrameWindow)
++        XMoveWindow(_display, _remoteFrameWindow, frameX, frameY);
++    if (_remoteFrameShmPumping && _remoteFrameWidth == before.width &&
++        _remoteFrameHeight == before.height) {
++        _remoteFrameShmStart(_remoteFrameShm, _remoteFrameWindow, _remoteFrameGC, path);
++        if (!_remoteFrameValid)
++            _remoteFrameShmPut(_remoteFrameShm, _remoteFrameWindow, _remoteFrameGC, NULL, 0);
++        XRaiseWindow(_display, _remoteFrameWindow);
++        XFlush(_display);
++        _remoteFrameSequence = before.sequence;
++        snprintf(_remoteFramePath, sizeof(_remoteFramePath), "%s", path);
++        _remoteFrameValid = YES;
++        return YES;
++    }
++    if (_remoteFrameValid && _remoteFrameWindow &&
++        _remoteFrameSequence == before.sequence &&
++        _remoteFrameWidth == before.width && _remoteFrameHeight == before.height &&
++        strcmp(_remoteFramePath, path) == 0) {
++        XRaiseWindow(_display, _remoteFrameWindow);
++        XFlush(_display);
++        return YES;
++    }
++    if (pixelCapacity < before.dataSize) {
++        unsigned char *newPixels = realloc(pixels, before.dataSize);
++        if (!newPixels) {
++            return _remoteFrameValid;
++        }
++        pixels = newPixels;
++        pixelCapacity = before.dataSize;
++    }
++    memcpy(pixels, (char *)_remoteFrameMapping + sizeof(before) + framePayloadOffset(before.magic, before.pixelFormat), before.dataSize);
++    __sync_synchronize();
++    memcpy(&after, _remoteFrameMapping, sizeof(after));
++    if (after.sequence != before.sequence || (after.sequence & 1)) {
++        if (tlog) { fputc('T', tlog); }
++        return _remoteFrameValid;
++    }
++
++    XImage *image = XCreateImage(_display, _visualInfo->visual,
++        _visualInfo->depth, ZPixmap, 0, (char *)pixels, before.width,
++        before.height, 32, before.bytesPerRow);
++    if (!image)
++        return _remoteFrameValid;
++
++    if (!_remoteFrameWindow) {
++        int shapeMajor, shapeMinor;
++        if (!XShapeQueryVersion(_display, &shapeMajor, &shapeMinor) ||
++            shapeMajor < 1 || (shapeMajor == 1 && shapeMinor < 1)) {
++            image->data = NULL;
++            XDestroyImage(image);
++            return _remoteFrameValid;
++        }
++        XSetWindowAttributes attrs = {0};
++        attrs.background_pixmap = None;
++        attrs.event_mask = ExposureMask;
++        _remoteFrameWindow = XCreateWindow(_display, _window, frameX, frameY,
++            before.width, before.height, 0, CopyFromParent, InputOutput,
++            CopyFromParent, CWBackPixmap | CWEventMask, &attrs);
++        /* An empty input shape lets clicks and motion reach native views. */
++        XShapeCombineRectangles(_display, _remoteFrameWindow, ShapeInput,
++            0, 0, NULL, 0, ShapeSet, Unsorted);
++        [(X11Display *) [NSDisplay currentDisplay] setWindow: self forID: _remoteFrameWindow];
++        _remoteFrameGC = XCreateGC(_display, _remoteFrameWindow, 0, NULL);
++    }
++    if (_remoteFrameWidth != before.width || _remoteFrameHeight != before.height) {
++        if (_remoteFrameShm) {
++            _remoteFrameShmDestroy(_remoteFrameShm);
++            _remoteFrameShm = NULL;
++            _remoteFrameShmPumping = NO;
++            [self setRemoteFrameTimerSlow: NO];
++        }
++        XResizeWindow(_display, _remoteFrameWindow, before.width, before.height);
++        _remoteFrameWidth = before.width;
++        _remoteFrameHeight = before.height;
++    }
++    XMapRaised(_display, _remoteFrameWindow);
++    typedef void *(*CreateShm)(Display *, Visual *, unsigned, unsigned, unsigned);
++    typedef int (*PutShm)(void *, Drawable, GC, const void *, size_t);
++    static CreateShm createShm;
++    static PutShm putShm;
++    static void (*destroyShm)(void *);
++    static int (*startShm)(void *, Drawable, GC, const char *);
++    static BOOL checkedShm;
++    if (!checkedShm) {
++        checkedShm = YES;
++        const char *transportPath = getenv("DARLING_XSHM_LIBRARY");
++        const char *shmOption = getenv("RCLOL_XSHM");
++        void *transport = (shmOption && shmOption[0] == '0') ? NULL :
++            dlopen(transportPath ? transportPath : "/usr/lib/native/libDarlingXShm.dylib",
++                RTLD_NOW | RTLD_LOCAL);
++        void *(*getCreate)(void) = transport ? dlsym(transport, "DarlingXShmGetCreate") : NULL;
++        void *(*getPut)(void) = transport ? dlsym(transport, "DarlingXShmGetPut") : NULL;
++        void *(*getDestroy)(void) = transport ? dlsym(transport, "DarlingXShmGetDestroy") : NULL;
++        void *(*getStart)(void) = transport ? dlsym(transport, "DarlingXShmGetStart") : NULL;
++        if (getCreate && getPut && getDestroy) {
++            createShm = (CreateShm)getCreate();
++            putShm = (PutShm)getPut();
++            destroyShm = (void (*)(void *))getDestroy();
++            if (getStart) startShm = (int (*)(void *, Drawable, GC, const char *))getStart();
++        }
++    }
++    if (!_remoteFrameShm && createShm && putShm && destroyShm) {
++        /* The independent connection must see this client's child creation
++         * before issuing its first upload or creating its private GC. */
++        XSync(_display, False);
++        _remoteFrameShm = createShm(_display, _visualInfo->visual,
++            _visualInfo->depth, before.width, before.height);
++        _remoteFrameShmDestroy = destroyShm;
++        _remoteFrameShmPut = putShm;
++        _remoteFrameShmStart = startShm;
++        if (getenv("RCLOL_XSHM_TRACE")) {
++            extern int __simple_printf(const char *, ...);
++            __simple_printf("REMOTE_XSHM width=%u height=%u active=%d\n",
++                before.width, before.height, _remoteFrameShm != NULL);
++        }
++    }
++    if (!_remoteFrameShm || !putShm(_remoteFrameShm, _remoteFrameWindow,
++            _remoteFrameGC, pixels, before.bytesPerRow)) {
++        XPutImage(_display, _remoteFrameWindow, _remoteFrameGC, image, 0, 0, 0, 0,
++            before.width, before.height);
++        XFlush(_display);
++    }
++    if (_remoteFrameShm && startShm && !_remoteFrameShmPumping) {
++        _remoteFrameShmPumping = startShm(_remoteFrameShm, _remoteFrameWindow, _remoteFrameGC, path);
++        if (_remoteFrameShmPumping) [self setRemoteFrameTimerSlow: YES];
++    }
++    _remoteFrameSequence = before.sequence;
++    snprintf(_remoteFramePath, sizeof(_remoteFramePath), "%s", path);
++    _remoteFrameValid = YES;
++    image->data = NULL; /* pixels is reused by the next frame */
++    XDestroyImage(image);
++    if (tlog) { fputc('b', tlog); fflush(tlog); }
++    return YES;
++}
++
++- (BOOL) handleRemoteFrameExpose: (Window) window {
++    if (!window || window != _remoteFrameWindow)
++        return NO;
++    _remoteFrameValid = NO;
++    [self presentRemoteCAFrame: nil];
++    return YES;
++}
++
+ - (Window) windowHandle {
+     return _window;
+ }
+@@ -470,14 +1004,32 @@ static NSData *makeWindowIcon() {
+     const char *text = [title cString];
+     XStringListToTextProperty((char **) &text, 1, &prop);
+     XSetWMName(_display, _window, &prop);
++    if (title && [title rangeOfString:@"(TM) Client" options:NSCaseInsensitiveSearch].location != NSNotFound) {
++        [(X11Display *)[NSDisplay currentDisplay] updateMouseConfinementForWindow:self];
++    }
+ }
+ 
+ - (void) setFrame: (O2Rect) frame {
+-    frame = [self transformFrame: frame];
++    frame = [(X11Display *) [NSDisplay currentDisplay] rootRectForFrame: frame];
++    BOOL fullscreen = [self wantsFullscreenWithStyleMask:_styleMask rootFrame:frame];
++    if (!fullscreen) [self requestFullscreen:NO force:NO];
+     XMoveResizeWindow(_display, _window, frame.origin.x, frame.origin.y,
+                       frame.size.width, frame.size.height);
+     [self invalidateContextWithNewSize: frame.size];
+     _frame = frame;
++    // Nonresizable windows can be created at 1x1 and enlarged before display.
++    // Refresh the constraints so a managing compositor sees the current size.
++    if (!(_styleMask & NSWindowStyleMaskResizable)) {
++        if (!X11IsLeagueGameWindow(_display, _window, _delegate)) {
++            XSizeHints hints = {0};
++            hints.flags = PMinSize | PMaxSize;
++            hints.min_width = hints.max_width = frame.size.width;
++            hints.min_height = hints.max_height = frame.size.height;
++            XSetWMSizeHints(_display, _window, &hints, XA_WM_NORMAL_HINTS);
++        }
++    }
++    if (fullscreen) [self requestFullscreen:YES force:NO];
++    [(X11Display *)[NSDisplay currentDisplay] updateMouseConfinementForWindow:self];
+ }
+ 
+ - (void) setHasShadow: (BOOL) value {
+@@ -488,6 +1040,25 @@ static NSData *makeWindowIcon() {
+     _level = value;
+ }
+ 
++/* NSApplication's attention timer calls this for requestUserAttention:. The
++ * CGWindow base class raises an abstract-invocation exception, which aborted
++ * the whole LeagueClientUx process. Ask the window manager to mark the window
++ * as demanding attention instead. */
++- (void) flashWindow {
++    XClientMessageEvent event = {0};
++    event.type = ClientMessage;
++    event.window = _window;
++    event.message_type = XInternAtom(_display, "_NET_WM_STATE", False);
++    event.format = 32;
++    event.data.l[0] = 1; /* _NET_WM_STATE_ADD */
++    event.data.l[1] = (long) XInternAtom(_display, "_NET_WM_STATE_DEMANDS_ATTENTION", False);
++    event.data.l[3] = 1;
++    XSendEvent(_display, DefaultRootWindow(_display), False,
++               SubstructureNotifyMask | SubstructureRedirectMask,
++               (XEvent *) &event);
++    XFlush(_display);
++}
++
+ - (void) setOpaque: (BOOL) value {
+     _isOpaque = value;
+ }
+@@ -543,6 +1114,21 @@ static NSData *makeWindowIcon() {
+ - (void) makeKey {
+     [self ensureMapped];
+     XRaiseWindow(_display, _window);
++    /* darling-lol: League's game window is managed (not override-redirect), so keyboard focus is
++     * the WM's to give. Ask for activation once when the game makes it key; the WM's focus-stealing
++     * policy still applies, unlike a direct XSetInputFocus. */
++    if (X11IsLeagueGameWindow(_display, _window, _delegate)) {
++        XEvent act = {0};
++        act.xclient.type = ClientMessage;
++        act.xclient.window = _window;
++        act.xclient.message_type = XInternAtom(_display, "_NET_ACTIVE_WINDOW", False);
++        act.xclient.format = 32;
++        act.xclient.data.l[0] = 1; /* source: normal application */
++        act.xclient.data.l[1] = CurrentTime;
++        XSendEvent(_display, DefaultRootWindow(_display), False,
++                   SubstructureRedirectMask | SubstructureNotifyMask, &act);
++        XFlush(_display);
++    }
+ }
+ 
+ - (void) makeMain {
+@@ -559,7 +1145,29 @@ static NSData *makeWindowIcon() {
+     XRaiseWindow(_display, _window);
+ }
+ 
++/* darling-lol: AppKit asks every window whether it is miniaturized on every event poll (NSWindow
++ * _makeSureIsOnAScreen), and each answer was a synchronous X round trip (XGetWindowProperty): about 13 blocking waits
++ * per game frame. Reuse the answer for 100 ms per window. */
++#include <mach/mach_time.h>
++#define RCLOL_MINI_SLOTS 32
++static struct { Window window; uint64_t stamp; BOOL value; } rclolMini[RCLOL_MINI_SLOTS];
++
+ - (BOOL) isMiniaturized {
++    static mach_timebase_info_data_t tb;
++    if (tb.denom == 0) mach_timebase_info(&tb);
++    uint64_t now = mach_absolute_time();
++    unsigned slot = (unsigned) (_window % RCLOL_MINI_SLOTS);
++    if (rclolMini[slot].window == _window && rclolMini[slot].stamp != 0 &&
++        (now - rclolMini[slot].stamp) * tb.numer / tb.denom < 100000000ULL)
++        return rclolMini[slot].value;
++    BOOL value = [self rclolQueryMiniaturized];
++    rclolMini[slot].window = _window;
++    rclolMini[slot].value = value;
++    rclolMini[slot].stamp = now;
++    return value;
++}
++
++- (BOOL) rclolQueryMiniaturized {
+     Atom wmState = XInternAtom(_display, "_NET_WM_STATE", FALSE);
+     Atom hiddenState = XInternAtom(_display, "_NET_WM_STATE_HIDDEN", FALSE);
+ 
+@@ -614,7 +1222,56 @@ static NSData *makeWindowIcon() {
+     }
+ }
+ 
++- (void) presentSoftwareSurface {
++    /* The EGL window surface can be unavailable: the NVIDIA driver rejects the
++     * GLX-chosen visual, so eglCreateWindowSurface returns EGL_BAD_CONFIG and
++     * CGLFlushDrawable has no target to swap, leaving a native window black.
++     * Upload the Onyx software surface with XPutImage in that case. */
++    if (_context == nil || _window == None)
++        return;
++
++    O2Surface *surface = [_context surface];
++    if (surface == NULL)
++        return;
++
++    size_t width = O2SurfaceGetWidth(surface);
++    size_t height = O2SurfaceGetHeight(surface);
++    size_t bytesPerRow = O2SurfaceGetBytesPerRow(surface);
++    void *pixels = O2SurfaceGetPixelBytes(surface);
++    if (width == 0 || height == 0 || pixels == NULL || bytesPerRow < width * 4)
++        return;
++
++    XImage *image = XCreateImage(_display, _visualInfo->visual, _visualInfo->depth,
++        ZPixmap, 0, (char *) pixels, width, height, 32, bytesPerRow);
++    if (image == NULL)
++        return;
++
++    /* A GC is depth-specific; the default GC belongs to the root window. */
++    GC gc = XCreateGC(_display, _window, 0, NULL);
++    if (gc != NULL) {
++        XPutImage(_display, _window, gc, image, 0, 0, 0, 0, width, height);
++        XFlush(_display);
++        XFreeGC(_display, gc);
++    }
++    image->data = NULL;
++    XDestroyImage(image);
++}
++
+ - (void) openGLFlushBuffer {
++    /* A native panel (for example the file dialog) owns its content. When it has
++     * no EGL window surface, present the software surface directly and never let
++     * a same-sized shared Chromium frame cover it. */
++    if (_isPanel && _cglWindow == NULL) {
++        [self presentSoftwareSurface];
++        return;
++    }
++
++    /* A remote compositor surface owns this drawable while it is present.
++     * Swapping the local Onyx surface would erase it until the next timer
++     * tick. Keep local presentation for windows without a usable remote frame. */
++    if ([self presentRemoteCAFrame: nil])
++        return;
++
+     CGLError error;
+ 
+     CGLContextObj prevContext = CGLGetCurrentContext();
+@@ -652,7 +1309,7 @@ static NSData *makeWindowIcon() {
+ }
+ 
+ - (O2Rect) frame {
+-    return [self transformFrame: _frame];
++    return [(X11Display *) [NSDisplay currentDisplay] frameForRootRect: _frame];
+ }
+ 
+ static int ignoreBadWindow(Display *display, XErrorEvent *errorEvent) {
+@@ -666,6 +1323,7 @@ static int ignoreBadWindow(Display *display, XErrorEvent *errorEvent) {
+ }
+ 
+ - (void) frameChanged {
++    _remoteFrameTargetRefresh = 0;
+     XErrorHandler previousHandler = XSetErrorHandler(ignoreBadWindow);
+     @try {
+         Window root, parent;
+@@ -710,14 +1368,6 @@ static int ignoreBadWindow(Display *display, XErrorEvent *errorEvent) {
+     [_deviceDictionary addEntriesFromDictionary: entries];
+ }
+ 
+-- (O2Rect) transformFrame: (O2Rect) frame {
+-    return NSMakeRect(frame.origin.x,
+-                      DisplayHeight(_display, DefaultScreen(_display)) -
+-                              frame.origin.y - frame.size.height,
+-                      fmax(frame.size.width, 1.0),
+-                      fmax(frame.size.height, 1.0));
+-}
+-
+ - (NSPoint) transformPoint: (NSPoint) pos; {
+     return NSMakePoint(pos.x, _frame.size.height - pos.y);
+ }
+diff --git a/AppKit/include/AppKit/NSSavePanel.h b/AppKit/include/AppKit/NSSavePanel.h
+index 53bacc46..c64d0f3d 100644
+--- a/AppKit/include/AppKit/NSSavePanel.h
++++ b/AppKit/include/AppKit/NSSavePanel.h
+@@ -56,6 +56,8 @@ enum {
+ - (NSString *) filename;
+ 
+ - (void) beginWithCompletionHandler: (void (^)(NSModalResponse result)) handler;
++- (void) beginSheetModalForWindow: (NSWindow *) window
++                completionHandler: (void (^)(NSModalResponse result)) handler;
+ 
+ - (NSInteger) runModalForDirectory: (NSString *) directory
+                               file: (NSString *) file;
+@@ -79,6 +81,10 @@ enum {
+ 
+ - (void) setAccessoryView: (NSView *) view;
+ - (void) setCanCreateDirectories: (BOOL) value;
++- (void) setShowsTagField: (BOOL) value;
++- (void) setCanSelectHiddenExtension: (BOOL) value;
++- (void) setExtensionHidden: (BOOL) value;
++- (void) setNameFieldLabel: (NSString *) label;
+ - (void) setAllowedFileTypes: (NSArray *) value;
+ - (void) setAllowsOtherFileTypes: (BOOL) value;
+ 

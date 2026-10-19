@@ -6770,7 +6770,7 @@ diff --git a/private-include/indium/deferred-render-encoder.private.hpp b/privat
 new file mode 100644
 --- /dev/null
 +++ b/private-include/indium/deferred-render-encoder.private.hpp
-@@ -0,0 +1,372 @@
+@@ -0,0 +1,471 @@
 +#pragma once
 +
 +// Deferred render-command encoding.
@@ -6798,6 +6798,7 @@ new file mode 100644
 +#include <atomic>
 +#include <cstdint>
 +#include <cstdio>
++#include <ctime>
 +#include <dlfcn.h>
 +#include <memory>
 +#include <mutex>
@@ -6902,20 +6903,106 @@ new file mode 100644
 +			State(std::shared_ptr<PrivateCommandBuffer> cb, const RenderPassDescriptor& d) : commandBuffer(std::move(cb)), descriptor(d) {}
 +		};
 +
++		// Per-call translation cost of the replay. Guest file /tmp/metal-op-timing (re-read every 64 chunks) times every
++		// replayed op and aggregates it per kind, plus encoder creation and endEncoding, and prints a 5 s window in
++		// /tmp/metal-trace.log as `optime@<epoch>: ...`. Diagnostic only: the per-op clock_gettime pair costs ~50 ns,
++		// so subtract that from the per-kinds that matter. Not read while the file is absent.
++		namespace OpTiming {
++			inline bool enabled() {
++				static std::atomic<bool> value {false};
++				static std::atomic<unsigned> calls {0};
++				if ((calls.fetch_add(1, std::memory_order_relaxed) & 63) == 0)
++					value.store(access("/tmp/metal-op-timing", F_OK) == 0, std::memory_order_relaxed);
++				return value.load(std::memory_order_relaxed);
++			}
++			inline double now() {
++				struct timespec ts;
++				clock_gettime(CLOCK_MONOTONIC, &ts);
++				return double(ts.tv_sec) + double(ts.tv_nsec) * 1e-9;
++			}
++			struct Slot {
++				unsigned long long n = 0, ns = 0, max = 0, nslow = 0, nsslow = 0;
++			};
++			static constexpr unsigned kindCount = 30;
++			struct Table {
++				Slot kinds[kindCount];
++				Slot encoderCreate, encoderEnd, encoderRelease, chunk;
++				unsigned long long ops = 0;
++				double since = 0;
++			};
++			inline Table& table() {
++				static auto* t = new Table;
++				return *t;
++			}
++			inline const char* const* kindNames() {
++				static const char* const names[kindCount] = {
++					"SetPipeline", "FrontFacing", "CullMode", "DepthBias", "DepthClip", "Viewports", "Scissors",
++					"BlendColor", "DepthStencil", "FillMode", "StencilRef", "StencilRefFB", "VisibilityMode",
++					"DrawPrim", "DrawIdx", "VBytes", "VBuffer", "VBufferOffset", "VSampler", "VSamplerClamp",
++					"VTexture", "FBytes", "FBuffer", "FBufferOffset", "FSampler", "FSamplerClamp", "FTexture",
++					"UseResource", "UseResourceStages", "MemoryBarrier",
++				};
++				return names;
++			}
++			inline void add(Slot& s, double seconds) {
++				const auto ns = (unsigned long long) (seconds * 1e9);
++				++s.n;
++				s.ns += ns;
++				if (ns > s.max) s.max = ns;
++				// 100 us separates the steady per-call cost from one-off work inside the first use of a resource
++				// (pipeline/framebuffer/descriptor-pool creation), which would otherwise hide the steady cost in avg.
++				if (ns >= 100000) { ++s.nslow; s.nsslow += ns; }
++			}
++			inline void report() {
++				auto& t = table();
++				const double wall = now();
++				if (t.since == 0.0) { t.since = wall; return; }
++				const double window = wall - t.since;
++				if (window < 5.0) return;
++				if (FILE* f = fopen("/tmp/metal-trace.log", "a")) {
++					fprintf(f, "optime@%ld: translation=%.1fms/s ops=%llu (%.0f ns/op)",
++						(long) time(nullptr), double(t.chunk.ns) / window / 1e6,
++						t.ops, t.ops ? double(t.chunk.ns) / double(t.ops) : 0.0);
++					const auto dump = [&](const char* name, const Slot& s) {
++						if (!s.n) return;
++						// avg includes one-off first-use work; fast is the average of the calls below the 100 us line,
++						// i.e. what a steady-state frame pays per call.
++						const double fastAvg = s.n > s.nslow ? double(s.ns - s.nsslow) / double(s.n - s.nslow) / 1e3 : 0.0;
++						fprintf(f, " %s[n=%llu avg=%.2fus fast=%.2fus max=%.1fus slow=%llu/%.0f%%]", name,
++							s.n, double(s.ns) / double(s.n) / 1e3, fastAvg, double(s.max) / 1e3,
++							s.nslow, s.ns ? 100.0 * double(s.nsslow) / double(s.ns) : 0.0);
++					};
++					dump("encCreate", t.encoderCreate);
++					dump("encEnd", t.encoderEnd);
++					dump("encRelease", t.encoderRelease);
++					for (unsigned i = 0; i < kindCount; ++i) dump(kindNames()[i], t.kinds[i]);
++					fprintf(f, "\n");
++					fclose(f);
++				}
++				t = Table {};
++				t.since = wall;
++			}
++		}
++
 +		// Apply one chunk of recorded calls; `last` also ends the real encoder.
 +		inline void replay(State& st, const Buffers& r, bool last) {
 +			PoolScope pool;
++			const bool timing = OpTiming::enabled();
++			const double chunkStart = timing ? OpTiming::now() : 0.0;
 +			if (!st.real && !st.failed) {
++				const double createStart = timing ? OpTiming::now() : 0.0;
 +				try {
 +					st.real = st.commandBuffer->renderCommandEncoderNow(st.descriptor);
 +				} catch (const std::exception& e) {
 +					st.failed = true;
 +					if (FILE* f = fopen("/tmp/metal-trace.log", "a")) { fprintf(f, "async-encode: encoder creation failed: %s\n", e.what()); fclose(f); }
 +				}
++				if (timing) OpTiming::add(OpTiming::table().encoderCreate, OpTiming::now() - createStart);
 +			}
 +			if (!st.real) return;
 +			PrivateRenderCommandEncoder* real = st.real.get();
 +			for (const Op& op : r.ops) {
++				const double opStart = timing ? OpTiming::now() : 0.0;
 +				try {
 +					switch (op.kind) {
 +						case Kind::SetPipeline: real->setRenderPipelineState(std::static_pointer_cast<RenderPipelineState>(op.p)); break;
@@ -6955,10 +7042,22 @@ new file mode 100644
 +				} catch (const std::exception& e) {
 +					if (FILE* f = fopen("/tmp/metal-trace.log", "a")) { fprintf(f, "async-encode: op %d failed: %s\n", (int) op.kind, e.what()); fclose(f); }
 +				}
++				if (timing) OpTiming::add(OpTiming::table().kinds[(unsigned) op.kind], OpTiming::now() - opStart);
 +			}
 +			if (last) {
++				const double endStart = timing ? OpTiming::now() : 0.0;
 +				try { real->endEncoding(); } catch (...) {}
++				if (timing) OpTiming::add(OpTiming::table().encoderEnd, OpTiming::now() - endStart);
++				// the encoder destructor destroys the pass framebuffer and its image views
++				const double releaseStart = timing ? OpTiming::now() : 0.0;
 +				st.real.reset();
++				if (timing) OpTiming::add(OpTiming::table().encoderRelease, OpTiming::now() - releaseStart);
++			}
++			if (timing) {
++				auto& t = OpTiming::table();
++				OpTiming::add(t.chunk, OpTiming::now() - chunkStart);
++				t.ops += r.ops.size();
++				OpTiming::report();
 +			}
 +		}
 +

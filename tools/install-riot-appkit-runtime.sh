@@ -2,6 +2,15 @@
 # Install the rebuilt AppKit overlay and its paired X11 backend.
 # Manually exit the game and both clients, then shut down Darling before use.
 set -eu
+# An overlay only takes effect once the Darling namespace restarts, and that
+# restart closes any running client. Refuse to do that silently so an in-progress
+# download is never interrupted: exit the game and clients first, or override.
+if [ "${RIOT_ALLOW_RUNNING_CLIENT:-0}" != 1 ] &&
+   pgrep -f 'Applications/(Riot Clien[t]|League of Legend[s]).app/' >/dev/null 2>&1; then
+  echo "A Riot Client or League of Legends is running; a Darling restart closes it." >&2
+  echo "Exit the game and both clients first, or set RIOT_ALLOW_RUNNING_CLIENT=1 to override." >&2
+  exit 1
+fi
 project_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 guest_home=${RIOT_GUEST_HOME:-$HOME/.darling@GUEST_HOME@}
 framework="$guest_home/RuntimeFrameworks/AppKit.framework/Versions/C"
