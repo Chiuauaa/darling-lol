@@ -1,4 +1,4 @@
-# Snapshot status — 2026-10-14
+# Snapshot status — 2026-10-19
 
 This repository preserves a development runtime, including historical experiments. All 30 patches apply to their pinned revisions and the exported source matches the development tree for the patched files. A fresh checkout/build/install has not been validated end to end on another machine. The normal workflow uses manual client installation and play, without debugger attachment, client API calls or input automation.
 
@@ -15,13 +15,20 @@ Rift showed the full HUD at 59 FPS / 9 ms with zero `Metal Device timed out`
 entries. See
 [troubleshooting](TROUBLESHOOTING.md#nvidia-the-window-attaches-and-the-frame-is-dropped-fixed-2026-10-18).
 
-On this machine the game is **CPU-bound**, not GPU- or driver-bound: the GTX
-1070 idles at 14–16% while the i3-8100 (4 threads, no SMT) sits near saturation
-(`load` 8–12, with ~27% of CPU time in the kernel). The League client's Chromium
-stack alone uses ~1.8 cores during a match and the desktop plus background apps
-another ~0.5, so the game's threads contend for the four threads and FPS degrades
-as the match progresses. Measurements, the client-load breakdown and the open
-experiments are in
+On this machine the game is **CPU-bound**, not GPU- or driver-bound, and the
+single thread that paces the frame is Indium's **deferred-replay worker**
+(`indium-submit`): the GTX 1070 idles at 14–16% while the i3-8100 (4 threads, no
+SMT) sits near saturation (`load` 8–12, with ~27–41% of the game's CPU time in
+the kernel). Per-thread `/proc` sampling on 2026-10-19 put that worker at
+~0.55 core, almost all of it **kernel** time (~0.53 sys), with ~0 minor page
+faults and `State: R` — so it is syscall-bound, not allocation- or compute-bound.
+`vkQueueSubmit2` itself is free (avg 0.0 ms) and the presenting thread spends most
+of its wall time parked in `drain@commit` waiting for the worker, i.e. a frame is
+the serial `record + replay` chain. The League client's Chromium stack alone uses
+~1.8 cores during a match and the desktop plus background apps another ~0.5, so
+the game's threads also contend for the four threads and FPS degrades as the match
+progresses. Measurements, the client-load breakdown and the open experiments are
+in
 [WORKLOG-FPS-2026-10-18.md](WORKLOG-FPS-2026-10-18.md). The FPS table below is
 still from the AMD RADV machine.
 

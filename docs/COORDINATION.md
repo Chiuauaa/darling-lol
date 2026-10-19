@@ -56,3 +56,10 @@ Found while reviewing the tree; each item is tracked here until fixed.
 
 - 2026-10-19 (trailing): created this file and `tools/riot_build.py`; migrated
   the first batch of probe builders (resource-dir refresh + shared compile/link).
+- 2026-10-19 (fourth FPS session): per-thread profiling of a live match (read-only
+  `/proc`) pinned the NVIDIA frame pacer to the `indium-submit` replay worker
+  (~0.55 core, ~0.53 kernel time, no page faults, `State: R`). Extended the
+  diagnostic libindium overlay with binary-semaphore counters and wrote the
+  arm/restore capture recipe. **No `patches/` or runtime change** — the runtime was
+  restored to the stock `libindium` (`89e7338998e4d4de64192fa1fe3edf63`). Updated
+  README, STATUS, SETUP, TROUBLESHOOTING and the FPS worklog.

@@ -455,3 +455,33 @@ launch, window placement, click alignment and edge panning before rollout.
 
 After installing the tested X11 and CoreGraphics binaries locally, the user
 reported that everything was working (2026-10-16). Fullscreen policy was unchanged.
+
+## FPS replay-worker diagnostic (NVIDIA)
+
+A read-only recipe for locating where a slow frame goes, without touching the game
+process. It uses host `/proc` scheduling metadata plus a **diagnostic-only**
+libindium overlay that names the Indium threads (`indium-submit`, `indium-poll`,
+`indium-batch`) and, with guest `/tmp/metal-counters`, writes
+`indium-worker@` / `indium-worker-per-frame@` blocks to `/tmp/metal-trace.log`
+every 5 s. The overlay lives outside the tree and is never committed to
+`patches/`.
+
+1. Arm the counters **before the game process starts**: `darling shutdown`, install
+   the diagnostic `libindium`, recreate `/tmp/metal-counters`,
+   `/tmp/metal-debug-timing` and `/tmp/metal-debug-waits` **from inside the guest**,
+   then launch. `darling shutdown` wipes the guest `/tmp`, so re-arm afterwards.
+2. Play ~2 minutes with minions fighting. From the host, sample the game process's
+   threads (`/proc/<pid>/task/*/stat`): per-thread user/system time, minor faults
+   and voluntary/involuntary context switches. Read the trace at
+   `~/.darling/private/tmp/metal-trace.log`.
+3. Read `indium-worker-per-frame@` for the submit worker (`submitTasks/frame`,
+   `submitMs/frame`), the poll thread and the binary-semaphore churn
+   (`binarySemC/CE/D/frame`, `binarySemMs/frame`); read `optime@` (the
+   `/tmp/metal-op-timing` instrument) for the per-op replay breakdown.
+4. Restore the stock `libindium` when done. Never arm an experimental knob together
+   with a diagnostic: one knob per game start (see [AGENTS.md](../AGENTS.md)).
+
+On 2026-10-19 this recipe showed `indium-submit` at ~0.55 core, ~0.53 of it kernel
+time, ~0 minor page faults and `State: R`, while `vkQueueSubmit2` averaged 0.0 ms.
+The full numbers and the follow-up plan are in the
+[FPS worklog](WORKLOG-FPS-2026-10-18.md).

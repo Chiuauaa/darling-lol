@@ -176,6 +176,8 @@ It prints each thread-local access that calls its thunk without the descriptor i
 
 The game code itself runs natively under Darling: the x86-64 slice of the universal binary executes unchanged, picks its instruction-set paths with `cpuid` on the real CPU, and sizes its worker pool from the real logical CPU count. What differs from Windows is the path around it. Every Metal call goes through Objective-C, the Metal wrapper, Indium and Vulkan instead of a native Direct3D driver, and kernel services go through the emulation and darlingserver. In an ARAM fight the game's own code now takes most of a frame; see [status](STATUS.md#game-fps-2026-10-1314) for measurements.
 
+On the **NVIDIA GTX 1070** machine the remaining limit is sharper and differs from the AMD one. Per-thread `/proc` sampling on 2026-10-19 put Indium's single deferred-replay worker (`indium-submit`) at ~0.55 core, **~0.53 of it kernel time**, with ~0 minor page faults and `State: R` — syscall-bound, not allocation- or compute-bound. `vkQueueSubmit2` averages 0.0 ms and the presenting thread spends most of the frame blocked in `drain@commit` waiting for that worker. So a fix has to cut the per-commit replay work or the chain, not the `drain()` call or the GPU. The measurements, the diagnostic libindium overlay (`indium-worker@` counters) and the read-only capture/rollback recipe are in the [FPS worklog](WORKLOG-FPS-2026-10-18.md) (fourth session).
+
 If FPS drops back towards the 10-13 morning numbers (75–85 on Hexgate):
 
 1. Make sure the current kernel library, Metal and Indium overlays are installed and active: exit the game and both clients, then `darling shutdown` and `sh scripts/run.sh` ([setup](SETUP.md#game-process-switches)).

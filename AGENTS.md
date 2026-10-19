@@ -14,6 +14,7 @@ Conventions for AI agents working in this repository.
 - Test runtime/knob toggles one at a time, one per game start. Arming several at once once made a whole session's play fail with an unrelated abort.
 - `/tmp/metal-no-drawable-vram` aborts the game on NVIDIA (crash-loop at Metal resource creation); it is a RADV-only experiment. See `docs/SETUP.md` and `docs/TROUBLESHOOTING.md`.
 - Activating a rebuilt framework overlay needs `darling shutdown` then `sh scripts/run.sh`.
+- Diagnostic-only `libindium` overlays (thread naming plus worker/polling/`binarySem` counters) are built **outside** the tree and never committed to `patches/`; a capture ends by restoring the stock `libindium` (`89e7338998e4d4de64192fa1fe3edf63`). The capture/rollback recipe and the overlay's flags are in the FPS worklog and `docs/TESTING.md`.
 
 ## Anti-cheat (Vanguard)
 - Treat Vanguard as read-only. Never spoof it, fake its service, patch `libRiotClientFoundation`/`rcp-be-lol-vanguard`, or touch the game process (no memory read/write, no injection, no input automation, no `SIGSTOP`/`SIGCONT`).
