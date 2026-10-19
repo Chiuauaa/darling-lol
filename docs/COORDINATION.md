@@ -65,13 +65,30 @@ libraries.
 | `ses_eab329d85ffe9QhkOrMvZk6KsN` | passive sysctl + IOKit telemetry | writing `patches/xnu.patch`, `patches/iokitd.patch` |
 | `ses_ead69602affeKuqK6yU8E0rhzu` | reviewer + Python/tooling | static RE of `mvg` IOKit/sysctl surface |
 
+### Update 12:52 (-03) — coordinator
+
+- Bisect result (author session): the *pre-fifth-session* overlay **loads**, so the
+  black screen / `sig=6` is a regression from the 5th/6th indium hunks, not a
+  pre-existing crash. Next test needs a `darling shutdown` + `run.sh` with
+  `session5-clean` installed.
+- The GPU session had already begun editing `patches/metal--deps--indium.patch`
+  (first hunk: `presentationSemaphores` → `static thread_local`) when this was
+  written. That file is frozen until the bisect closes; the change is on the
+  *already-suspect* 6th-session code path.
+- Crash forensics from the author session: game process SIGSEGV in
+  `libobjc.A.dylib:objc_msgSend_stret` (offset `0x4089d`, zero isa) during the
+  loading screen; the same signature recurs on 10-17/10-18 across older builds,
+  so it is not automatically attributable to today's hunks.
+
 ### Who holds which shared resource
 
 - **`RuntimeLibraries/libindium.dylib` + the indium overlay**: held by the author
   session, mid-bisection. Installed at 12:42 is the *pre-fifth-session* build
-  (`99f2192c…`); backups `session5-clean` (`65c27806…`), `session6-24f7f7b`
-  (`cea9f6d1…`) and stock `darling-lol-backup` (`2c20e484…`) are alongside it.
-  Do **not** rebuild, install or swap this file until the bisect reports.
+  (`3df22735…`, md5); backups `session5-clean` (`2909b341…`),
+  `session6-24f7f7b` (`8acea7f3…`) and stock `darling-lol-backup` (`89e73389…`)
+  are alongside it. Build ids are **md5 sums**, not sha256 — an earlier revision
+  of this table quoted sha256 prefixes and was wrong. Do **not** rebuild, install
+  or swap this file until the bisect reports.
 - **`patches/xnu.patch`, `patches/iokitd.patch`**: owned by the telemetry
   session (additive, flag-gated hunks).
 - **`patches/darling.patch`, `patches/cocotron.patch`**: owned by the author
@@ -147,3 +164,35 @@ libraries.
   arm/restore capture recipe. **No `patches/` or runtime change** — the runtime was
   restored to the stock `libindium` (`89e7338998e4d4de64192fa1fe3edf63`). Updated
   README, STATUS, SETUP, TROUBLESHOOTING and the FPS worklog.
+- 2026-10-19 (author session, bisect open): **pre-5ª-sessão clean build is the
+  build under test.** I installed it at 12:42 from the committed pre-5ª source
+  (`libindium.dylib` md5 `3df22735e93c22675b792bfe5589c6e2`, kept as
+  `libindium.dylib.prefifth-clean`); `check-darwin-tlv-calls.py` passes. My saved
+  backups: `session5-clean` = `2909b341ccdafb8db51a476c3551820c` (5ª),
+  `session6-24f7f7b` = `8acea7f312a5e04b6a5230954c0702d9` (6ª), stock
+  `.darling-lol-backup` = `89e7338998e4d4de64192fa1fe3edf63`. Re-hashed at 12:42;
+  the digests are self-consistent and the 12:45 synthesis table's `99f2192c…` /
+  `65c27806…` / `cea9f6d1…` / `2c20e484…` do not correspond to these files. Per the
+  conflict rule I have frozen `patches/metal--deps--indium.patch`.
+  - **RESULT (pre-5ª test, done):** it **loads** — black screen gone, image up.
+    ⇒ **the regression lives in the 5ª/6ª hunks, it is not a pre-existing crash.**
+    The forensics below explain *how* those hunks corrupt the process.
+  - **Next test (needs one game start):** install `session5-clean` (`2909b341…`,
+    the 5ª build) and play. Loads ⇒ culprit is the 6ª hunk; dies ⇒ culprit is the
+    5ª hunk.
+  - **Suspected hunks:** (a) 5ª session event-loop wake coalescing in
+    `indium/device.cpp` (`_pollWaiting` guard, thread_local snapshot scratch in
+    `pollEvents`, `wakeupEventLoop`, `waitForSemaphore`); (b) 6ª session
+    batch-timer rewrite in `indium/command-buffer.cpp` (`flushSubmitBatchLocked`,
+    no-precommit). Neither reviewed change showed a memory-safety bug on
+    inspection.
+  - **Crash forensics (not yet tied to indium):** the black screen is the game
+    process taking SIGSEGV in `libobjc.A.dylib:objc_msgSend_stret` (offset
+    `0x4089d`, zero isa) during the loading screen; `launchd` also SIGSEGV'd in
+    `libsystem_platform:__platform_strlen` and took the session down. The game
+    signature (`bsd=11 addr=0x18`) recurs on 10-17 23:35, 10-18 02:08, 10-18
+    20:23 and 10-18 22:29 across older builds, so it may pre-date this work.
+  - **Worktree state (dirty, not committed):** the indium checkout currently holds
+    the pre-5ª files — `device.cpp` `f939e544…`, `command-buffer.cpp`
+    `8dece49e…`, `render-command-encoder.cpp` `76458c6f…`. The 6ª versions are
+    saved in `/tmp/six/src/indium/`.
