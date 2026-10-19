@@ -96,6 +96,31 @@ libraries.
   self-contained, already validated (`--check-only` 30/30) and Debug 6 has
   reviewed them. Any further change to those two files still goes to Debug 6.
 
+### Update 13:02 (-03) — coordinator
+
+Cross-reference of the GPU pull analysis with the rest of the tree. The archived
+numbers (FPS 27.8, `commits/frame` 23.9, `submitMs/frame` 25.4 ms on the worker,
+36 ms frame, `drain@commit` 58 % of the main thread's wall, worker 0.52–0.71 core
+with ~0.55 in `sys`, ~1 `vkQueueSubmit2`/frame, GPU 1–30 % at P5) give a measured
+ceiling of **≈664 commits/s = FPS × commits/frame**.
+
+Arithmetic that drives the priority: 60 FPS at 23.9 commits/frame needs ~1434
+commits/s, i.e. **2.16× the ceiling**. Trimming the fixed per-commit cost — which
+is what the 5th/6th/7th indium hunks do, and which the bisect currently blames for
+the black screen — cannot get there alone. Only two families can: **parallel
+replay** (capped at 2 workers: the host is an i3-8100, 4 threads, no SMT) and
+**fewer commits/frame** (coalescing in the batch/replay layer). Per-commit work is
+therefore a data point, not the plan.
+
+Consequences recorded in the queue handed to the implementer: close the bisect
+first, keep the 7th-session hunks as a separate later commit, attribute the worker's
+`sys` time with one `/tmp/metal-debug-timing` capture before choosing between the
+two families, only then evaluate the framebuffer cache (~26 create/destroy per
+frame) from measured cost, and design — not code — the two-worker replay.
+
+Sequencing of game starts stands: (1) bisect with `session5-clean`, (2) telemetry
+`/tmp/darling-hw-trace` capture, (3) FPS/timing capture.
+
 ### Who holds which shared resource
 
 - **`RuntimeLibraries/libindium.dylib` + the indium overlay**: held by the author
@@ -109,9 +134,12 @@ libraries.
   session (additive, flag-gated hunks).
 - **`patches/darling.patch`, `patches/cocotron.patch`**: owned by the author
   session (EGL/CGL, window attach, `NSSavePanel` selectors — all committed).
-- **`patches/indium.patch`**: contested. The author session wrote `67b3cd6` and
-  `24f7f7b` and is debugging them; the GPU session is about to edit the same
-  file. Freeze it until the bisect closes.
+- **`patches/indium.patch`**: contested, frozen until the bisect closes. The author
+  session wrote `67b3cd6` and `24f7f7b`; the GPU session applied three hunks in the
+  working tree (`presentationSemaphores` and `extraWaitSemaphores` →
+  `static thread_local`, one `dynamic_pointer_cast` → `else if`) and stopped there
+  — unbuilt, untested, uncommitted. The implementer of record decides whether they
+  survive, as their own commit after the bisect.
 - **`tools/riot_build.py`, this file, `.sh`→Python consolidation**: reviewer
   session.
 
@@ -246,3 +274,46 @@ libraries.
   the two property keys and any extra sysctl names are the deliverable. Strictly
   static: no runtime armed, no game start, no `patches/` touched, Vanguard
   untouched.
+- 2026-10-19 (telemetry session): `H4SYSCTL` lines now also carry `pid=` (cached
+  `__NR_getpid`), so both halves can be attributed per process; `H1IOKIT` already
+  carried `caller=`. Added `build/hw-trace-crosscheck.py` (untracked, under
+  `build/`) — it parses the raw log and prints the static-vs-captured key diff
+  (`[seen]`/`[MISSING]`/`[extra]`), per-pid sysctl counts, captured IOKit ops and
+  the matched criteria. Hunks re-validated: `prepare.py --check-only` 30/30,
+  `validate.py` PASS, clean-revision apply reproduces the working tree. Capture
+  stays queued at position 2 (after the indium bisect), never with `/tmp/metal-*`.
+  Note: `KextManagerCopyLoadedKextInfo` and `IOCreatePlugInInterfaceForService`
+  are client-side (`patches/IOKitUser.patch`), so they never reach `iokitd`; the
+  "kextd returns NULL" proof needs a scoped hunk there — flagged, not written,
+  since that component is not part of the telemetry patches owned so far.
+- 2026-10-19 (telemetry session, after the coordinator's queue note): took
+  `patches/IOKitUser.patch` for the client-side kext trace, as authorized. New
+  `kext.subproj/HWTrace.h` (same `/tmp/darling-hw-trace` gate) plus two lines:
+  `KextManagerCopyLoadedKextInfo` logs `op=kext_copy_loaded rv=NULL|dict`, and
+  `OSKextCopyLoadedKextInfo` logs `op=kext_request op_result=<n> present=0|1`
+  (the kextd RPC refuses because there is no `kextd`). Added the CPU keys to the
+  cross-check expected set (`hw.ncpu`, `hw.logicalcpu`, `hw.physicalcpu`,
+  `machdep.cpu.brand_string`; all four exist in the sysctl tables) — the H4 trace
+  records them automatically since it logs every key. Revalidated: `prepare.py
+  --check-only` 30/30, clean-revision apply reproduces the tree for all three
+  patches, `validate.py` PASS. Owner of record: this session for `xnu.patch`,
+  `iokitd.patch`, `IOKitUser.patch`. Confirmed: capture stays at **#2**, right
+  after the black-screen bisect closes, one game start, only `/tmp/darling-hw-trace`.
+- 2026-10-19 (reviewer/tooling session, coordinator's items 2–3; item 1 above
+  unchanged): **item 2** — `docs/TROUBLESHOOTING.md` gained the `prepare.py`
+  shared-checkout bullet: a refusal/failure at one component (usually `iokitd`)
+  while another session holds edits there is a dirty shared checkout, not a
+  regression in the patch under test; the normal run stops with the "checkout has
+  other edits" message, while `--check-only` validates the committed patch text
+  against the pinned revision through a temporary index and leaves the shared
+  worktree untouched, so it tells the two apart. **item 3** — the FPS analysis is
+  now one tracked entry point, `tools/fps_diag.py` (`perframe`, `optime`,
+  `thread-prof`, `report` self-contained and read-only; `arm-counters`/`restore`/
+  `collect-match`/`watch`/`probe-summary` *delegate* to the recipes in
+  `build/fps-diag`, overridable with `FPS_DIAG_DIR`). The historical
+  `python3 build/fps-diag/{perframe,optime,thread-prof}.py` invocations still work
+  as thin shims over it (originals kept in `build/fps-diag/legacy-analysis/`);
+  output verified byte-identical against the legacy scripts on
+  `build/fps-diag/match2-metal-trace.log`. README architecture paragraph and
+  `docs/TESTING.md` updated. No `patches/`, no RuntimeLibraries and no runtime
+  knob touched; strictly static/tooling.
